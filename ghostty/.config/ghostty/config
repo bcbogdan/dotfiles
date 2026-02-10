@@ -1,0 +1,52 @@
+
+
+font-thicken = true
+bold-is-bright = true
+font-style-bold = true 
+# window-decoration = none
+
+
+window-padding-balance = true
+window-padding-x = 0
+window-padding-y = 0
+
+# Guake style config
+# ATM it has limitations - tabs don't work and it doesn't show in fullscreen apps
+# I'll keep using iterm2 for now
+# keybind = global:cmd+`=toggle_quick_terminal
+# quick-terminal-animation-duration = 0.2q
+
+# tmux mapping
+# keybinding = super+t=text:
+
+keybind = super+t=unbind
+keybind = cmd+1=unbind
+keybind = cmd+2=unbind
+keybind = cmd+3=unbind
+keybind = cmd+4=unbind
+keybind = cmd+5=unbind
+keybind = cmd+6=unbind
+keybind = cmd+7=unbind
+keybind = cmd+8=unbind
+keybind = cmd+9=unbind
+keybind = cmd+s=text:\x00s
+keybind = cmd+t=text:\x00c
+keybind = cmd+w=text:\x00&
+keybind = cmd+1=text:\x001
+keybind = cmd+2=text:\x002q
+keybind = cmd+3=text:\x003
+keybind = cmd+4=text:\x004
+keybind = cmd+5=text:\x005
+keybind = cmd+6=text:\x006
+keybind = cmd+7=text:\x007
+keybind = cmd+8=text:\x008
+keybind = cmd+9=text:\x009
+keybind = cmd+right=text:\x00)
+keybind = cmd+left=text:\x00(
+keybind = cmd+right=text:\x00)
+
+keybind = cmd+d=unbind
+keybind = cmd+shift+d=unbind
+keybind = cmd+x=close_window
+
+

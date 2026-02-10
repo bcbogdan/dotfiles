@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+profile=${1:-}
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+case "$profile" in
+  macos)
+    packages=(zsh bash git ghostty tmux lazygit yazi kitty karabiner mise nvim opencode)
+    ;;
+  remote)
+    packages=(zsh bash git tmux lazygit yazi mise nvim opencode)
+    ;;
+  *)
+    echo "Usage: ./install <macos|remote>" >&2
+    exit 1
+    ;;
+esac
+
+command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
+command -v stow >/dev/null || { echo "stow is required" >&2; exit 1; }
+
+clone_if_missing() {
+  local repository=$1 destination=$2
+  if [[ ! -d "$destination/.git" ]]; then
+    mkdir -p "$(dirname "$destination")"
+    git clone --depth 1 "$repository" "$destination"
+  fi
+}
+
+clone_if_missing https://github.com/ohmyzsh/ohmyzsh.git "$HOME/.oh-my-zsh"
+clone_if_missing https://github.com/zsh-users/zsh-autosuggestions.git "$HOME/.oh-my-zsh/custom/plugins/zsh-autosuggestions"
+clone_if_missing https://github.com/tmux-plugins/tpm.git "$HOME/.config/tmux/plugins/tpm"
+
+stow --restow --no-folding --dir="$root" --target="$HOME" "${packages[@]}"
+
+export PATH="$HOME/.local/bin:$PATH"
+if command -v mise >/dev/null; then
+  (cd "$root" && mise install)
+fi
+
+if command -v tmux >/dev/null; then
+  export TMUX_PLUGIN_MANAGER_PATH="$HOME/.config/tmux/plugins/"
+  "$HOME/.config/tmux/plugins/tpm/bin/install_plugins"
+fi

@@ -1,0 +1,16 @@
+[settings]
+idiomatic_version_file_enable_tools = []
+
+[tools]
+node = "24"
+python = "3.11.14"
+go = "1.25.7"
+rust = "stable"
+java = "21"
+bun = "1.3.14"
+neovim = "latest"
+atuin = "latest"
+lazygit = "latest"
+yazi = "latest"
+zoxide = "latest"
+"github:MitMaro/git-interactive-rebase-tool" = "latest"

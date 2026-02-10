@@ -1,0 +1,18 @@
+[user]
+  name = Bogdan Carpusor
+  email = bogdan.carpusor@gmail.com
+
+[http]
+  emptyAuth = true
+
+[filter "lfs"]
+  clean = git-lfs clean -- %f
+  smudge = git-lfs smudge -- %f
+  process = git-lfs filter-process
+  required = true
+
+[sequence]
+  editor = interactive-rebase-tool
+
+[merge]
+  tool = vimdiff
