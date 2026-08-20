@@ -45,6 +45,7 @@ command -v zoxide >/dev/null && eval "$(zoxide init zsh)"
 
 if [[ $(uname -s) == Linux ]]; then
   export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+  export BROWSER=xdg-open
 fi
 
 export PATH="$HOME/.tfenv/bin:$PATH"

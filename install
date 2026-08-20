@@ -5,10 +5,10 @@ profile=${1:-}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 case "$profile" in
   macos)
-    packages=(zsh bash git ghostty tmux lazygit yazi kitty karabiner mise nvim opencode)
+    packages=(zsh bash git ghostty tmux herdr lazygit yazi kitty karabiner mise nvim opencode remote-open)
     ;;
   remote)
-    packages=(zsh bash git tmux lazygit yazi mise nvim opencode)
+    packages=(zsh bash git tmux herdr lazygit yazi mise nvim opencode)
     ;;
   *)
     echo "Usage: ./install <macos|remote>" >&2
@@ -32,6 +32,10 @@ clone_if_missing https://github.com/zsh-users/zsh-autosuggestions.git "$HOME/.oh
 clone_if_missing https://github.com/tmux-plugins/tpm.git "$HOME/.config/tmux/plugins/tpm"
 
 stow --restow --no-folding --dir="$root" --target="$HOME" "${packages[@]}"
+
+if [[ "$profile" == macos ]]; then
+  "$HOME/.local/bin/goblin-open-setup" install
+fi
 
 export PATH="$HOME/.local/bin:$PATH"
 if command -v mise >/dev/null; then

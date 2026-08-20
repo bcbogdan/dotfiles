@@ -19,8 +19,7 @@ vim.keymap.set('n', '<C-u>', '<C-u>zz')
 -- Paste does not overwrite the default register
 vim.keymap.set('v', 'p', '"_dP')
 
--- Press Y to yank to the end of the line
-vim.keymap.set('n', 'Y', 'y$')
+vim.keymap.set('n', 'Y', 'yy', { desc = 'Yank line' })
 
 -- Select all text in buffer (vag)
 vim.keymap.set('n', 'vag', 'ggVG', { desc = 'Select all text in buffer' })

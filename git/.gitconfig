@@ -16,3 +16,6 @@
 
 [merge]
   tool = vimdiff
+
+[include]
+  path = ~/.config/dev-machine/gitconfig

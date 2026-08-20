@@ -13,4 +13,5 @@ command -v zoxide >/dev/null && eval "$(zoxide init bash)"
 
 if [[ $(uname -s) == Linux ]]; then
   export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+  export BROWSER=xdg-open
 fi

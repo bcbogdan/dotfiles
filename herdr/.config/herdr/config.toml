@@ -1,0 +1,65 @@
+onboarding = false
+
+[theme]
+name = "kanagawa"
+
+[keys]
+prefix = "ctrl+space"
+
+# Preserve tmux shortcuts that overlap Herdr defaults.
+settings = "prefix+comma"
+reload_config = "prefix+shift+c"
+resize_mode = "prefix+shift+z"
+
+workspace_picker = ["prefix+s", "cmd+s"]
+previous_workspace = "prefix+up"
+next_workspace = "prefix+down"
+rename_workspace = "prefix+shift+r"
+close_workspace = "prefix+shift+w"
+
+previous_agent = "prefix+alt+["
+next_agent = ["prefix+alt+]", "cmd+shift+s"]
+focus_agent = "prefix+alt+1..9"
+
+new_tab = ["prefix+t", "prefix+c"]
+rename_tab = "prefix+r"
+previous_tab = ["prefix+[", "shift+left", "alt+shift+h"]
+next_tab = ["prefix+]", "shift+right", "alt+shift+l"]
+switch_tab = "prefix+1..9"
+close_tab = "prefix+w"
+
+focus_pane_left = ["prefix+h", "alt+left"]
+focus_pane_down = ["prefix+j", "alt+down"]
+focus_pane_up = ["prefix+k", "alt+up"]
+focus_pane_right = ["prefix+l", "alt+right"]
+
+split_vertical = "prefix+shift+l"
+split_horizontal = "prefix+shift+j"
+close_pane = "prefix+x"
+zoom = "prefix+f"
+
+swap_pane_left = "prefix+alt+h"
+swap_pane_down = "prefix+alt+j"
+swap_pane_up = "prefix+alt+k"
+swap_pane_right = "prefix+alt+l"
+
+# Herdr only creates right/down splits, so split then swap for left/up.
+[[keys.command]]
+key = "prefix+shift+h"
+type = "shell"
+description = "split left"
+command = 'pane_id=$("$HERDR_BIN_PATH" pane split "$HERDR_ACTIVE_PANE_ID" --direction right --focus | jq -r ".result.pane.pane_id") && "$HERDR_BIN_PATH" pane swap --pane "$pane_id" --direction left'
+
+[[keys.command]]
+key = "prefix+shift+k"
+type = "shell"
+description = "split up"
+command = 'pane_id=$("$HERDR_BIN_PATH" pane split "$HERDR_ACTIVE_PANE_ID" --direction down --focus | jq -r ".result.pane.pane_id") && "$HERDR_BIN_PATH" pane swap --pane "$pane_id" --direction up'
+
+[ui]
+tab_bar_position = "bottom"
+sidebar_collapsed_mode = "hidden"
+hide_tab_bar_when_single_tab = true
+pane_gaps = false
+pane_outer_borders = false
+pane_scrollbars = false

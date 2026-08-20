@@ -169,9 +169,9 @@ vim.g.markdown_recommended_style = 0
 -- Automatically write file when switching between buffers
 vim.opt.autowrite = true
 
--- only set clipboard if not in ssh, to make sure the OSC 52
--- integration works automatically. Requires Neovim >= 0.10.0
-vim.opt.clipboard = vim.env.SSH_TTY and '' or 'unnamedplus' -- Sync with system clipboard
+-- Neovim uses OSC 52 as its clipboard provider over SSH.
+vim.g.clipboard = 'osc52'
+vim.opt.clipboard = 'unnamedplus'
 
 -- Hide * markup for bold and italic, but not markers with substitutions
 vim.opt.conceallevel = 2
