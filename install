@@ -42,6 +42,11 @@ if command -v mise >/dev/null; then
   (cd "$root" && mise install)
 fi
 
+if command -v cargo >/dev/null && command -v herdr >/dev/null; then
+  (cd "$root/plugins/herdr-picker" && cargo build --release --locked)
+  herdr plugin link "$root/plugins/herdr-picker" --enabled
+fi
+
 if command -v tmux >/dev/null; then
   export TMUX_PLUGIN_MANAGER_PATH="$HOME/.config/tmux/plugins/"
   "$HOME/.config/tmux/plugins/tpm/bin/install_plugins"

@@ -30,6 +30,7 @@ keybind = cmd+7=unbind
 keybind = cmd+8=unbind
 keybind = cmd+9=unbind
 keybind = cmd+s=text:\x00s
+keybind = cmd+shift+s=text:\x00\x1b[115:83;2u
 keybind = cmd+t=text:\x00c
 keybind = cmd+w=text:\x00&
 keybind = cmd+1=text:\x001
@@ -48,5 +49,3 @@ keybind = cmd+right=text:\x00)
 keybind = cmd+d=unbind
 keybind = cmd+shift+d=unbind
 keybind = cmd+x=close_window
-
-

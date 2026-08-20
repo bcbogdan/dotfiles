@@ -44,6 +44,11 @@ The installer uses `stow --no-folding` so tools can write runtime state under
 Zsh, zsh-autosuggestions, TPM plugins, and the tools declared in the mise
 configuration.
 
+The installer also builds and links the local Herdr unified picker when
+`cargo` and `herdr` are available. In Herdr, `Cmd-S` opens Workspaces and
+`Cmd-Shift-S` opens Agents; the same shortcuts switch tabs or close an already
+active tab while the picker is open. The third tab lists zoxide directories.
+
 The Git config optionally includes `~/.config/dev-machine/gitconfig`. Remote
 machine provisioning owns that file for directory-scoped commit identities; the
 include is inert on machines where the file does not exist.
