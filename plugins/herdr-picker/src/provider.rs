@@ -119,6 +119,11 @@ pub struct Client<R> {
     herdr: OsString,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmResult {
+    pub resolved_workspace_id: Option<String>,
+}
+
 impl<R: Runner> Client<R> {
     pub fn new(runner: R, herdr: OsString) -> Self {
         Self { runner, herdr }
@@ -166,16 +171,29 @@ impl<R: Runner> Client<R> {
         ])
     }
 
-    pub fn confirm(&self, target: &Target, workspaces: &[Item]) -> Result<(), Error> {
+    pub fn confirm(&self, target: &Target, workspaces: &[Item]) -> Result<ConfirmResult, Error> {
         match target {
-            Target::Workspace { id } => self.herdr(&["workspace", "focus", id]).map(|_| ()),
-            Target::Agent { pane_id } => self.herdr(&["agent", "focus", pane_id]).map(|_| ()),
+            Target::Workspace { id } => {
+                self.herdr(&["workspace", "focus", id])?;
+                Ok(ConfirmResult {
+                    resolved_workspace_id: None,
+                })
+            }
+            Target::Agent { pane_id } => {
+                self.herdr(&["agent", "focus", pane_id])?;
+                Ok(ConfirmResult {
+                    resolved_workspace_id: None,
+                })
+            }
             Target::Directory { path } => {
                 if let Some(id) = workspace_for_path(path, workspaces) {
-                    return self.herdr(&["workspace", "focus", id]).map(|_| ());
+                    self.herdr(&["workspace", "focus", id])?;
+                    return Ok(ConfirmResult {
+                        resolved_workspace_id: Some(id.to_string()),
+                    });
                 }
                 let label = sensible_label(path);
-                self.herdr_os(&[
+                let raw = self.herdr_os(&[
                     OsString::from("workspace"),
                     OsString::from("create"),
                     OsString::from("--cwd"),
@@ -183,8 +201,11 @@ impl<R: Runner> Client<R> {
                     OsString::from("--label"),
                     OsString::from(label),
                     OsString::from("--focus"),
-                ])
-                .map(|_| ())
+                ])?;
+                let workspace_id = parse_created_workspace_id(&raw)?;
+                Ok(ConfirmResult {
+                    resolved_workspace_id: Some(workspace_id),
+                })
             }
         }
     }
@@ -268,6 +289,29 @@ fn parse_panes(raw: &str) -> Result<Vec<Pane>, Error> {
 }
 fn parse_agents(raw: &str) -> Result<Vec<Agent>, Error> {
     result_array(raw, "agents")
+}
+
+fn parse_created_workspace_id(raw: &str) -> Result<String, Error> {
+    let value: Value =
+        serde_json::from_str(raw).map_err(|error| Error::Parse("workspace create", error))?;
+    let workspace = value
+        .pointer("/result/workspace")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            Error::Structure("workspace create", "missing result.workspace object".into())
+        })?;
+    workspace
+        .get("workspace_id")
+        .or_else(|| workspace.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            Error::Structure(
+                "workspace create",
+                "missing result.workspace.workspace_id".into(),
+            )
+        })
 }
 
 fn workspace_items(workspaces: &[Workspace], panes: &[Pane], self_pane: Option<&str>) -> Vec<Item> {
@@ -498,7 +542,11 @@ mod tests {
             _timeout: Duration,
         ) -> Result<String, Error> {
             self.calls.lock().unwrap().push(args.to_vec());
-            Ok("{}".into())
+            if args.iter().any(|arg| arg == "create") {
+                Ok(r#"{"id":"cli:workspace:create","result":{"type":"workspace_created","workspace":{"workspace_id":"w9","label":"project"},"tab":{"tab_id":"w9:t1"},"root_pane":{"pane_id":"w9:p1"}}}"#.into())
+            } else {
+                Ok("{}".into())
+            }
         }
     }
 
@@ -529,6 +577,14 @@ mod tests {
         assert!(parse_workspaces("{}").is_err());
         assert!(parse_panes(r#"{"result":{}}"#).is_err());
         assert!(parse_agents(r#"{"result":{"agents":{}}}"#).is_err());
+    }
+
+    #[test]
+    fn parses_herdr_workspace_create_response_and_rejects_malformed_success() {
+        let raw = r#"{"id":"cli:workspace:create","result":{"type":"workspace_created","workspace":{"workspace_id":"w9","label":"project"},"tab":{"tab_id":"w9:t1"},"root_pane":{"pane_id":"w9:p1"}}}"#;
+        assert_eq!(parse_created_workspace_id(raw).unwrap(), "w9");
+        assert!(parse_created_workspace_id(r#"{"result":{"workspace":{}}}"#).is_err());
+        assert!(parse_created_workspace_id(r#"{"result":{}}"#).is_err());
     }
 
     #[test]
@@ -608,7 +664,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let client = Client::new(runner, OsString::from("herdr"));
-        client
+        let result = client
             .confirm(
                 &Target::Directory {
                     path: PathBuf::from("/tmp/a project"),
@@ -616,6 +672,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        assert_eq!(result.resolved_workspace_id.as_deref(), Some("w9"));
         let calls = client.runner.calls.lock().unwrap();
         assert!(calls[0].contains(&OsString::from("/tmp/a project")));
     }

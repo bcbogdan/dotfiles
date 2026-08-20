@@ -35,7 +35,6 @@ impl Reducer {
 
     pub fn key(&mut self, app: &mut App, key: KeyEvent, now: Instant) -> Effect {
         self.expire_prefix(app, now);
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if is_prefix(key) {
             self.prefix_at = Some(now);
             app.pending_prefix = true;
@@ -44,6 +43,9 @@ impl Reducer {
         if app.pending_prefix {
             self.prefix_at = None;
             app.pending_prefix = false;
+            if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+                return Effect::None;
+            }
             let requested = match key.code {
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     Some(Tab::Agents)
@@ -62,31 +64,60 @@ impl Reducer {
             }
             return Effect::None;
         }
+        if let Some(shortcut) = control_shortcut(key) {
+            return match shortcut {
+                'c' => {
+                    app.should_close = true;
+                    Effect::Close
+                }
+                'h' => {
+                    app.switch_tab(app.tab.adjacent(-1));
+                    Effect::SelectionChanged
+                }
+                'l' => {
+                    app.switch_tab(app.tab.adjacent(1));
+                    Effect::SelectionChanged
+                }
+                'k' | 'p' => {
+                    app.move_selection(-1);
+                    Effect::SelectionChanged
+                }
+                'j' => {
+                    app.move_selection(1);
+                    Effect::SelectionChanged
+                }
+                'u' => {
+                    app.state_mut().query.clear();
+                    app.reconcile_selection();
+                    Effect::SelectionChanged
+                }
+                'o' => {
+                    app.cycle_sort();
+                    Effect::SelectionChanged
+                }
+                _ => Effect::None,
+            };
+        }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('c') if key.code == KeyCode::Esc || ctrl => {
+            KeyCode::Esc => {
                 app.should_close = true;
                 Effect::Close
             }
             KeyCode::Enter => Effect::Confirm,
-            KeyCode::Left | KeyCode::Char('h') if key.code == KeyCode::Left || ctrl => {
+            KeyCode::Left => {
                 app.switch_tab(app.tab.adjacent(-1));
                 Effect::SelectionChanged
             }
-            KeyCode::Right | KeyCode::Char('l') if key.code == KeyCode::Right || ctrl => {
+            KeyCode::Right => {
                 app.switch_tab(app.tab.adjacent(1));
                 Effect::SelectionChanged
             }
-            KeyCode::Up | KeyCode::Char('k') if key.code == KeyCode::Up || ctrl => {
+            KeyCode::Up => {
                 app.move_selection(-1);
                 Effect::SelectionChanged
             }
-            KeyCode::Down | KeyCode::Char('j') if key.code == KeyCode::Down || ctrl => {
+            KeyCode::Down => {
                 app.move_selection(1);
-                Effect::SelectionChanged
-            }
-            KeyCode::Char('u') if ctrl => {
-                app.state_mut().query.clear();
-                app.reconcile_selection();
                 Effect::SelectionChanged
             }
             KeyCode::Backspace => {
@@ -94,7 +125,9 @@ impl Reducer {
                 app.reconcile_selection();
                 Effect::SelectionChanged
             }
-            KeyCode::Char(character) if !ctrl && !key.modifiers.contains(KeyModifiers::SUPER) => {
+            KeyCode::Char(character)
+                if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() =>
+            {
                 app.state_mut().query.push(character);
                 app.reconcile_selection();
                 Effect::SelectionChanged
@@ -105,8 +138,31 @@ impl Reducer {
 }
 
 fn is_prefix(key: KeyEvent) -> bool {
-    (key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL))
-        || key.code == KeyCode::Null
+    (key.code == KeyCode::Char(' ') && has_control_modifiers(key.modifiers))
+        || (key.code == KeyCode::Null
+            && key
+                .modifiers
+                .difference(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                .is_empty())
+}
+
+fn control_shortcut(key: KeyEvent) -> Option<char> {
+    if !has_control_modifiers(key.modifiers) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(character) if character.is_ascii_alphabetic() => {
+            Some(character.to_ascii_lowercase())
+        }
+        _ => None,
+    }
+}
+
+fn has_control_modifiers(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL)
+        && modifiers
+            .difference(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            .is_empty()
 }
 
 #[cfg(test)]
@@ -262,6 +318,126 @@ mod tests {
             preview_pane: None,
             match_paths: Vec::new(),
             target: crate::model::Target::Workspace { id: id.into() },
+        }
+    }
+
+    #[test]
+    fn ctrl_p_moves_up_with_wrap_while_plain_p_types() {
+        let now = Instant::now();
+        let mut reducer = Reducer::new();
+        let mut app = App::new(Tab::Workspaces);
+        app.set_items(Tab::Workspaces, vec![test_item("one"), test_item("two")]);
+        reducer.key(
+            &mut app,
+            key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            now,
+        );
+        assert_eq!(app.state().selected_id.as_deref(), Some("two"));
+        reducer.key(&mut app, key(KeyCode::Char('p'), KeyModifiers::NONE), now);
+        assert_eq!(app.state().query, "p");
+    }
+
+    #[test]
+    fn ctrl_o_cycles_sort_without_editing_query() {
+        let now = Instant::now();
+        let mut reducer = Reducer::new();
+        let mut app = App::new(Tab::Workspaces);
+        app.state_mut().query = "text".into();
+        for expected in [
+            crate::model::SortOrder::AgeAscending,
+            crate::model::SortOrder::AgeDescending,
+            crate::model::SortOrder::Recent,
+        ] {
+            reducer.key(
+                &mut app,
+                key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                now,
+            );
+            assert_eq!(app.state().sort, expected);
+            assert_eq!(app.state().query, "text");
+        }
+    }
+
+    #[test]
+    fn ctrl_shortcut_modifier_matrix_is_consistent() {
+        let now = Instant::now();
+        for (code, modifiers) in [
+            (KeyCode::Char('p'), KeyModifiers::CONTROL),
+            (
+                KeyCode::Char('P'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            let mut app = App::new(Tab::Workspaces);
+            app.set_items(Tab::Workspaces, vec![test_item("one"), test_item("two")]);
+            Reducer::new().key(&mut app, key(code, modifiers), now);
+            assert_eq!(app.state().selected_id.as_deref(), Some("two"));
+        }
+        for (code, modifiers, expected) in [
+            (KeyCode::Char('p'), KeyModifiers::NONE, "p"),
+            (KeyCode::Char('P'), KeyModifiers::SHIFT, "P"),
+            (KeyCode::Char('o'), KeyModifiers::NONE, "o"),
+            (KeyCode::Char('O'), KeyModifiers::SHIFT, "O"),
+        ] {
+            let mut app = App::new(Tab::Workspaces);
+            Reducer::new().key(&mut app, key(code, modifiers), now);
+            assert_eq!(app.state().query, expected);
+        }
+        for forbidden in [
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::META,
+            KeyModifiers::HYPER,
+        ] {
+            for character in ['P', 'O'] {
+                let mut app = App::new(Tab::Workspaces);
+                app.set_items(Tab::Workspaces, vec![test_item("one"), test_item("two")]);
+                Reducer::new().key(
+                    &mut app,
+                    key(KeyCode::Char(character), KeyModifiers::CONTROL | forbidden),
+                    now,
+                );
+                assert_eq!(app.state().selected_id.as_deref(), Some("one"));
+                assert_eq!(app.state().sort, crate::model::SortOrder::Recent);
+                assert!(app.state().query.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_shift_o_cycles_sort() {
+        let mut app = App::new(Tab::Workspaces);
+        Reducer::new().key(
+            &mut app,
+            key(
+                KeyCode::Char('O'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            Instant::now(),
+        );
+        assert_eq!(app.state().sort, crate::model::SortOrder::AgeAscending);
+        assert!(app.state().query.is_empty());
+    }
+
+    #[test]
+    fn prefix_rejects_extra_modifiers() {
+        let now = Instant::now();
+        for forbidden in [
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::META,
+            KeyModifiers::HYPER,
+        ] {
+            let mut app = App::new(Tab::Workspaces);
+            let mut reducer = Reducer::new();
+            reducer.key(
+                &mut app,
+                key(KeyCode::Char(' '), KeyModifiers::CONTROL | forbidden),
+                now,
+            );
+            assert!(!app.pending_prefix);
+            reducer.key(&mut app, key(KeyCode::Null, forbidden), now);
+            assert!(!app.pending_prefix);
         }
     }
 }

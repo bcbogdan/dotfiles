@@ -3,6 +3,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph, Tabs};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::model::{App, LoadState, PreviewState, Tab};
 
@@ -14,18 +15,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let (left, right) = panels(body);
     draw_left(frame, app, left);
     draw_preview(frame, app, right);
-    let prefix = if app.pending_prefix {
-        "prefix…  "
-    } else {
-        ""
-    };
-    frame.render_widget(
-        Paragraph::new(format!(
-            " {prefix}enter focus  ←/→ tabs  ↑/↓ move  ^u clear  esc close"
-        ))
-        .dim(),
-        footer,
-    );
+    frame.render_widget(Paragraph::new(footer_text(app, footer.width)).dim(), footer);
 }
 
 fn panels(area: Rect) -> (Rect, Rect) {
@@ -68,18 +58,20 @@ fn draw_left(frame: &mut Frame, app: &App, area: Rect) {
             .divider("  "),
         tabs,
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("❯ ", Style::new().cyan().bold()),
-            Span::raw(app.state().query.as_str()),
-        ])),
-        search,
-    );
-    let width = u16::try_from(app.state().query.chars().count()).unwrap_or(u16::MAX);
-    frame.set_cursor_position(Position::new(
-        search.x.saturating_add(2).saturating_add(width),
-        search.y,
-    ));
+    let mut search_line = Line::from(vec![
+        Span::styled("❯ ", Style::new().cyan().bold()),
+        Span::raw(app.state().query.as_str()),
+    ]);
+    if search.width >= 24 {
+        search_line.push_span(Span::styled(
+            format!("  [{}]", app.state().sort.label()),
+            Style::new().dim(),
+        ));
+    }
+    frame.render_widget(Paragraph::new(search_line), search);
+    if let Some(position) = search_cursor(search, app.state().query.as_str()) {
+        frame.set_cursor_position(position);
+    }
     match &app.state().source {
         LoadState::Loading => centered(frame, list, "Loading…"),
         LoadState::Error(error) => centered(frame, list, &format!("Error: {error}")),
@@ -110,6 +102,41 @@ fn draw_left(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
     }
+}
+
+fn footer_text(app: &App, width: u16) -> String {
+    if let Some(warning) = &app.warning {
+        return format!(" ! {warning}");
+    }
+    let prefix = if app.pending_prefix {
+        "prefix…  "
+    } else {
+        ""
+    };
+    let hints = if width >= 72 {
+        "enter focus  ^p up  ^o sort  ←/→ tabs  ↑/↓ move  esc close"
+    } else if width >= 45 {
+        "^p up  ^o sort  ←/→ tabs  esc close"
+    } else if width >= 28 {
+        "^p up  ^o sort  esc close"
+    } else {
+        "^p  ^o  esc"
+    };
+    format!(" {prefix}{hints}")
+}
+
+fn search_cursor(area: Rect, query: &str) -> Option<Position> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let query_width = UnicodeWidthStr::width(query);
+    let offset = 2usize.saturating_add(query_width);
+    let maximum = usize::from(area.width.saturating_sub(1));
+    Some(Position::new(
+        area.x
+            .saturating_add(u16::try_from(offset.min(maximum)).unwrap_or(u16::MAX)),
+        area.y,
+    ))
 }
 
 fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
@@ -226,8 +253,12 @@ mod tests {
     }
 
     fn render(width: u16, height: u16) -> String {
+        render_app(&app(), width, height)
+    }
+
+    fn render_app(app: &App, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let frame = terminal.draw(|frame| draw(frame, &app())).unwrap();
+        let frame = terminal.draw(|frame| draw(frame, app)).unwrap();
         frame
             .buffer
             .content
@@ -243,6 +274,9 @@ mod tests {
             assert!(screen.contains("Workspaces"));
             assert!(screen.contains("dotfiles"));
             assert!(screen.contains("Nothing to preview"));
+            assert!(screen.contains("[Recent]"));
+            assert!(screen.contains("^p up"));
+            assert!(screen.contains("^o sort"));
         }
     }
 
@@ -252,5 +286,30 @@ mod tests {
         let (narrow_left, narrow_right) = panels(Rect::new(0, 0, 70, 30));
         assert_eq!(wide_left.y, wide_right.y);
         assert!(narrow_right.y > narrow_left.y);
+    }
+
+    #[test]
+    fn tiny_narrow_layouts_handle_long_wide_unicode_queries() {
+        let mut app = app();
+        app.state_mut().query = "界界界界界界界界界界-long-query".into();
+        for (width, height) in [(30, 3), (40, 5), (50, 8)] {
+            render_app(&app, width, height);
+            let footer = footer_text(&app, width);
+            assert!(footer.contains("^p"));
+            assert!(footer.contains("^o"));
+        }
+        assert_eq!(
+            search_cursor(Rect::new(2, 4, 10, 1), "界界界界界"),
+            Some(Position::new(11, 4))
+        );
+    }
+
+    #[test]
+    fn narrow_footer_compacts_and_history_warning_is_visible() {
+        assert_eq!(footer_text(&app(), 20), " ^p  ^o  esc");
+        let mut app = app();
+        app.warning = Some("history not saved".into());
+        assert!(footer_text(&app, 40).contains("history not saved"));
+        assert!(render_app(&app, 40, 8).contains("history not saved"));
     }
 }

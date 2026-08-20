@@ -1,4 +1,8 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use crate::history::History;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -34,11 +38,59 @@ impl Tab {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SortOrder {
+    #[default]
+    Recent,
+    AgeAscending,
+    AgeDescending,
+}
+
+impl SortOrder {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Recent => Self::AgeAscending,
+            Self::AgeAscending => Self::AgeDescending,
+            Self::AgeDescending => Self::Recent,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Recent => "Recent",
+            Self::AgeAscending => "Age ↑",
+            Self::AgeDescending => "Age ↓",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Workspace { id: String },
     Agent { pane_id: String },
     Directory { path: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum HistoryKey {
+    Workspace(String),
+    Agent(String),
+    Directory(PathBuf),
+}
+
+impl HistoryKey {
+    pub fn workspace(id: impl Into<String>) -> Self {
+        Self::Workspace(id.into())
+    }
+
+    pub fn agent(pane_id: impl Into<String>) -> Self {
+        Self::Agent(pane_id.into())
+    }
+
+    pub fn directory(path: &Path) -> Self {
+        Self::Directory(canonicalish(path))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +119,14 @@ impl Item {
             target: self.target.clone(),
         }
     }
+
+    pub fn history_key(&self) -> HistoryKey {
+        match &self.target {
+            Target::Workspace { id } => HistoryKey::workspace(id),
+            Target::Agent { pane_id } => HistoryKey::agent(pane_id),
+            Target::Directory { path } => HistoryKey::directory(path),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +149,7 @@ pub struct TabState {
     pub query: String,
     pub selected_id: Option<String>,
     pub source: LoadState,
+    pub sort: SortOrder,
 }
 
 impl Default for TabState {
@@ -97,6 +158,7 @@ impl Default for TabState {
             query: String::new(),
             selected_id: None,
             source: LoadState::Loading,
+            sort: SortOrder::Recent,
         }
     }
 }
@@ -110,7 +172,9 @@ pub struct App {
     pub refresh_generation: u64,
     pub pending_prefix: bool,
     pub should_close: bool,
+    pub warning: Option<String>,
     workspace_identity: Vec<Item>,
+    history: History,
 }
 
 impl App {
@@ -123,7 +187,9 @@ impl App {
             refresh_generation: 0,
             pending_prefix: false,
             should_close: false,
+            warning: None,
             workspace_identity: Vec::new(),
+            history: History::default(),
         }
     }
 
@@ -137,13 +203,39 @@ impl App {
 
     pub fn filtered(&self) -> Vec<&Item> {
         let query = self.state().query.to_lowercase();
-        match &self.state().source {
+        let mut filtered: Vec<_> = match &self.state().source {
             LoadState::Ready(items) => items
                 .iter()
-                .filter(|item| subsequence(&query, &item.search.to_lowercase()))
+                .enumerate()
+                .filter(|(_, item)| subsequence(&query, &item.search.to_lowercase()))
                 .collect(),
             LoadState::Loading | LoadState::Error(_) => Vec::new(),
-        }
+        };
+        let history = &self.history;
+        filtered.sort_by(|(left_index, left), (right_index, right)| {
+            let first_seen = || {
+                history
+                    .first_seen(&right.history_key())
+                    .cmp(&history.first_seen(&left.history_key()))
+            };
+            let order = match self.state().sort {
+                SortOrder::Recent => match (
+                    history.last_accessed(&left.history_key()),
+                    history.last_accessed(&right.history_key()),
+                ) {
+                    (Some(left), Some(right)) => right.cmp(&left).then_with(first_seen),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => first_seen(),
+                },
+                SortOrder::AgeAscending => first_seen(),
+                SortOrder::AgeDescending => history
+                    .first_seen(&left.history_key())
+                    .cmp(&history.first_seen(&right.history_key())),
+            };
+            order.then_with(|| left_index.cmp(right_index))
+        });
+        filtered.into_iter().map(|(_, item)| item).collect()
     }
 
     pub fn selected(&self) -> Option<&Item> {
@@ -175,6 +267,51 @@ impl App {
 
     pub fn workspace_identity(&self) -> &[Item] {
         &self.workspace_identity
+    }
+
+    pub fn set_history(&mut self, history: History) {
+        self.history = history;
+    }
+
+    pub fn history(&self) -> &History {
+        &self.history
+    }
+
+    pub fn observe_visible(&mut self, now: u64) -> bool {
+        let visible: Vec<_> = self
+            .tabs
+            .iter()
+            .filter_map(|state| match &state.source {
+                LoadState::Ready(items) => Some(items.as_slice()),
+                LoadState::Loading | LoadState::Error(_) => None,
+            })
+            .flatten()
+            .collect();
+        let observed = self.history.observe(visible.iter().copied(), now);
+        let keys = visible.iter().map(|item| item.history_key()).collect();
+        observed | self.history.prune(&keys, now)
+    }
+
+    pub fn visible_history_keys(&self) -> HashSet<HistoryKey> {
+        self.tabs
+            .iter()
+            .filter_map(|state| match &state.source {
+                LoadState::Ready(items) => Some(items.as_slice()),
+                LoadState::Loading | LoadState::Error(_) => None,
+            })
+            .flatten()
+            .map(Item::history_key)
+            .collect()
+    }
+
+    pub fn record_access(&mut self, key: &HistoryKey, now: u64) {
+        self.history.access(key, now);
+    }
+
+    pub fn cycle_sort(&mut self) {
+        let next = self.state().sort.next();
+        self.state_mut().sort = next;
+        self.reconcile_selection();
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -313,5 +450,93 @@ mod tests {
         app.set_items(Tab::Workspaces, vec![item("w1", "workspace")]);
         app.tabs[Tab::Workspaces.index()].source = LoadState::Error("refresh failed".into());
         assert_eq!(app.workspace_identity()[0].id, "w1");
+    }
+
+    #[test]
+    fn sort_defaults_to_recent_and_is_independent_per_tab() {
+        let mut app = App::new(Tab::Workspaces);
+        assert!(app.tabs.iter().all(|state| state.sort == SortOrder::Recent));
+        app.cycle_sort();
+        assert_eq!(app.state().sort, SortOrder::AgeAscending);
+        app.switch_tab(Tab::Agents);
+        assert_eq!(app.state().sort, SortOrder::Recent);
+    }
+
+    #[test]
+    fn sort_orders_use_history_then_provider_order() {
+        let mut app = App::new(Tab::Workspaces);
+        let items = vec![
+            item("a", "item"),
+            item("b", "item"),
+            item("c", "item"),
+            item("d", "item"),
+        ];
+        let mut history = History::default();
+        history.observe([&items[0]], 10);
+        history.observe([&items[1]], 20);
+        history.observe([&items[2], &items[3]], 30);
+        history.access(&items[1].history_key(), 40);
+        history.access(&items[0].history_key(), 50);
+        app.set_history(history);
+        app.set_items(Tab::Workspaces, items);
+
+        assert_eq!(ids(&app), ["a", "b", "c", "d"]);
+        app.cycle_sort();
+        assert_eq!(ids(&app), ["c", "d", "b", "a"]);
+        app.cycle_sort();
+        assert_eq!(ids(&app), ["a", "b", "c", "d"]);
+        app.cycle_sort();
+        assert_eq!(ids(&app), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn filtering_happens_before_sorting() {
+        let mut app = App::new(Tab::Workspaces);
+        let items = vec![
+            item("old-match", "match"),
+            item("new-other", "other"),
+            item("new-match", "match"),
+        ];
+        let mut history = History::default();
+        history.observe([&items[0]], 1);
+        history.observe([&items[1], &items[2]], 2);
+        app.set_history(history);
+        app.set_items(Tab::Workspaces, items);
+        app.state_mut().query = "match".into();
+        assert_eq!(ids(&app), ["new-match", "old-match"]);
+    }
+
+    #[test]
+    fn cycling_sort_preserves_selection_and_preview_identity() {
+        let mut app = App::new(Tab::Workspaces);
+        let mut first = item("a", "item");
+        first.preview_pane = Some("p1".into());
+        app.set_items(Tab::Workspaces, vec![first, item("b", "item")]);
+        app.move_selection(1);
+        let identity = app.selected().unwrap().preview_identity();
+        app.cycle_sort();
+        assert_eq!(app.state().selected_id.as_deref(), Some("b"));
+        assert_eq!(app.selected().unwrap().preview_identity(), identity);
+    }
+
+    fn ids(app: &App) -> Vec<&str> {
+        app.filtered()
+            .into_iter()
+            .map(|item| item.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn history_keys_are_namespaced_against_cross_source_collisions() {
+        let workspace = HistoryKey::workspace("same");
+        let agent = HistoryKey::agent("same");
+        let directory = HistoryKey::directory(Path::new("same"));
+        assert_ne!(workspace, agent);
+        assert_ne!(workspace, directory);
+        assert_ne!(agent, directory);
+        assert_eq!(
+            HistoryKey::directory(Path::new("/tmp/a/../b")),
+            HistoryKey::directory(Path::new("/tmp/b"))
+        );
     }
 }
