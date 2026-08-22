@@ -5,7 +5,7 @@ profile=${1:-}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 case "$profile" in
   macos)
-    packages=(zsh bash git ghostty tmux herdr lazygit yazi kitty karabiner mise nvim opencode remote-open)
+    packages=(zsh bash git ssh ghostty tmux herdr lazygit yazi kitty karabiner mise nvim opencode remote-open)
     ;;
   remote)
     packages=(zsh bash git tmux herdr lazygit yazi mise nvim opencode)

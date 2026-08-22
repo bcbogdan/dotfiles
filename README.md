@@ -9,6 +9,7 @@ Each top-level folder is a Stow package:
 - `zsh`
 - `bash`
 - `git`
+- `ssh` (macOS only)
 - `ghostty`
 - `tmux`
 - `herdr`
@@ -45,9 +46,10 @@ Zsh, zsh-autosuggestions, TPM plugins, and the tools declared in the mise
 configuration.
 
 The installer also builds and links the local Herdr unified picker when
-`cargo` and `herdr` are available. In Herdr, `Cmd-S` opens Workspaces and
-`Cmd-Shift-S` opens Agents; the same shortcuts switch tabs or close an already
-active tab while the picker is open. The third tab lists zoxide directories.
+`cargo` and `herdr` are available. In Ghostty and Kitty, `Cmd-S` opens
+Workspaces and `Cmd-Shift-S` opens Agents; the same shortcuts switch tabs or
+close an already active tab while the picker is open. The third tab lists
+zoxide directories.
 
 The Git config optionally includes `~/.config/dev-machine/gitconfig`. Remote
 machine provisioning owns that file for directory-scoped commit identities; the
@@ -59,7 +61,23 @@ To remove links from the remote profile:
 stow --delete --no-folding --target="$HOME" zsh bash git tmux herdr lazygit yazi mise nvim opencode
 ```
 
-For macOS, also include `ghostty`, `kitty`, `karabiner`, and `remote-open`.
+For macOS, also include `ssh`, `ghostty`, `kitty`, `karabiner`, and
+`remote-open`.
+
+## Goblin Herdr
+
+The macOS profile installs the `goblin` SSH target, which connects as `dev` to
+the `goblin-dev` Tailscale host with strict host-key checking and no agent
+forwarding. Attach the local Herdr client to the remote server with:
+
+```bash
+herdr --remote goblin
+```
+
+The shell integration selects server keybindings for Goblin because Herdr does
+not send local plugin-action bindings to remote sessions. An explicit
+`--remote-keybindings` option overrides this default. Detach and reattach after
+changing the keybinding source.
 
 ## Goblin Browser Opener
 

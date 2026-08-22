@@ -51,4 +51,5 @@ fi
 export PATH="$HOME/.tfenv/bin:$PATH"
 export PATH="$HOME/.npm-global/bin:$PATH"
 
+[[ -f "$HOME/.config/herdr/shell-init.sh" ]] && source "$HOME/.config/herdr/shell-init.sh"
 [ -f "$HOME/.zshrc.local" ] && source "$HOME/.zshrc.local"

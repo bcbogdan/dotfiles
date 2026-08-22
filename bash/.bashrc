@@ -15,3 +15,5 @@ if [[ $(uname -s) == Linux ]]; then
   export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
   export BROWSER=xdg-open
 fi
+
+[[ -f "$HOME/.config/herdr/shell-init.sh" ]] && source "$HOME/.config/herdr/shell-init.sh"
