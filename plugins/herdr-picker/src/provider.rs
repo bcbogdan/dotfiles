@@ -1,6 +1,8 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -95,9 +97,28 @@ impl Runner for SystemRunner {
             source,
         })?;
         if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+            let message = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                #[cfg(unix)]
+                if let Some(signal) = status.signal() {
+                    return Err(Error::Command {
+                        program: name,
+                        message: format!("terminated by signal {signal}"),
+                    });
+                }
+                status.code().map_or_else(
+                    || "terminated without an exit status".into(),
+                    |code| format!("exit status {code}"),
+                )
+            };
             return Err(Error::Command {
                 program: name,
-                message: String::from_utf8_lossy(&stderr).trim().to_string(),
+                message,
             });
         }
         Ok(String::from_utf8_lossy(&stdout).into_owned())
@@ -683,6 +704,40 @@ mod tests {
         assert!(sources[0].is_ok());
         assert!(sources[1].is_ok());
         assert_eq!(sources[2].as_ref().unwrap_err(), "zoxide is unavailable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_failure_reports_stdout_or_signal_when_stderr_is_empty() {
+        let stdout_error = SystemRunner
+            .run(
+                OsStr::new("/bin/sh"),
+                &args(&["-c", "printf structured-error; exit 7"]),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert_eq!(stdout_error.to_string(), "/bin/sh failed: structured-error");
+
+        let status_error = SystemRunner
+            .run(
+                OsStr::new("/bin/sh"),
+                &args(&["-c", "exit 7"]),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert_eq!(status_error.to_string(), "/bin/sh failed: exit status 7");
+
+        let signal_error = SystemRunner
+            .run(
+                OsStr::new("/bin/sh"),
+                &args(&["-c", "kill -9 $$"]),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert_eq!(
+            signal_error.to_string(),
+            "/bin/sh failed: terminated by signal 9"
+        );
     }
 
     #[test]
