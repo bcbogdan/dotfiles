@@ -43,16 +43,18 @@ pub struct SystemRunner;
 impl Runner for SystemRunner {
     fn run(&self, program: &OsStr, args: &[OsString], timeout: Duration) -> Result<String, Error> {
         let name = program.to_string_lossy().into_owned();
-        let mut stdout = tempfile::tempfile().map_err(|source| Error::Spawn {
+        let invocation = format_invocation(program, args);
+        let mut stdout = capture_file().map_err(|source| Error::Spawn {
             program: name.clone(),
             source,
         })?;
-        let mut stderr = tempfile::tempfile().map_err(|source| Error::Spawn {
+        let mut stderr = capture_file().map_err(|source| Error::Spawn {
             program: name.clone(),
             source,
         })?;
         // Files avoid inherited-pipe hangs; timed-out grandchildren may still exit later.
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout.try_clone().map_err(|source| {
@@ -66,12 +68,14 @@ impl Runner for SystemRunner {
                     program: name.clone(),
                     source,
                 }
-            })?))
-            .spawn()
-            .map_err(|source| Error::Spawn {
-                program: name.clone(),
-                source,
-            })?;
+            })?));
+        if std::env::var_os("RUST_BACKTRACE").is_none() {
+            command.env("RUST_BACKTRACE", "1");
+        }
+        let mut child = command.spawn().map_err(|source| Error::Spawn {
+            program: name.clone(),
+            source,
+        })?;
         if child
             .wait_timeout(timeout)
             .map_err(|source| Error::Spawn {
@@ -107,7 +111,7 @@ impl Runner for SystemRunner {
                 #[cfg(unix)]
                 if let Some(signal) = status.signal() {
                     return Err(Error::Command {
-                        program: name,
+                        program: invocation,
                         message: format!("terminated by signal {signal}"),
                     });
                 }
@@ -117,12 +121,26 @@ impl Runner for SystemRunner {
                 )
             };
             return Err(Error::Command {
-                program: name,
+                program: invocation,
                 message,
             });
         }
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
+}
+
+fn format_invocation(program: &OsStr, args: &[OsString]) -> String {
+    let mut invocation = program.to_string_lossy().into_owned();
+    for arg in args {
+        let _ = write!(invocation, " {:?}", arg.to_string_lossy());
+    }
+    invocation
+}
+
+fn capture_file() -> std::io::Result<std::fs::File> {
+    std::env::var_os("HERDR_PLUGIN_STATE_DIR")
+        .or_else(|| std::env::var_os("HOME"))
+        .map_or_else(tempfile::tempfile, tempfile::tempfile_in)
 }
 
 fn read_tail(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
@@ -716,7 +734,10 @@ mod tests {
                 Duration::from_secs(1),
             )
             .unwrap_err();
-        assert_eq!(stdout_error.to_string(), "/bin/sh failed: structured-error");
+        assert_eq!(
+            stdout_error.to_string(),
+            "/bin/sh \"-c\" \"printf structured-error; exit 7\" failed: structured-error"
+        );
 
         let status_error = SystemRunner
             .run(
@@ -725,7 +746,10 @@ mod tests {
                 Duration::from_secs(1),
             )
             .unwrap_err();
-        assert_eq!(status_error.to_string(), "/bin/sh failed: exit status 7");
+        assert_eq!(
+            status_error.to_string(),
+            "/bin/sh \"-c\" \"exit 7\" failed: exit status 7"
+        );
 
         let signal_error = SystemRunner
             .run(
@@ -736,7 +760,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             signal_error.to_string(),
-            "/bin/sh failed: terminated by signal 9"
+            "/bin/sh \"-c\" \"kill -9 $$\" failed: terminated by signal 9"
         );
     }
 
