@@ -1,8 +1,10 @@
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use crate::model::{Item, Tab};
+use crate::profile;
 use crate::provider::{directory_summary, Client, Runner, SystemRunner};
 
 struct RefreshRequest {
@@ -13,6 +15,7 @@ struct RefreshRequest {
 struct PreviewRequest {
     generation: u64,
     item: Item,
+    queued_at: Option<Instant>,
 }
 
 pub enum Message {
@@ -73,7 +76,11 @@ impl Runtime {
     pub fn preview(&self, generation: u64, item: Item) {
         let (slot, ready) = &*self.preview;
         if let Ok(mut pending) = slot.lock() {
-            *pending = Some(PreviewRequest { generation, item });
+            *pending = Some(PreviewRequest {
+                generation,
+                item,
+                queued_at: profile::timestamp(),
+            });
             ready.notify_one();
         }
     }
@@ -89,11 +96,16 @@ fn refresh_worker<R: Runner>(
     messages: &mpsc::Sender<Message>,
 ) {
     while let Ok(request) = requests.recv() {
+        let refresh = profile::span(
+            "refresh.worker",
+            || serde_json::json!({ "generation": request.generation }),
+        );
         let result = client.load(request.self_pane.as_deref());
         let _ = messages.send(Message::Refresh {
             generation: request.generation,
             result,
         });
+        drop(refresh);
     }
 }
 
@@ -112,6 +124,19 @@ fn preview_worker<R: Runner>(
             }
             slot.take().expect("preview request was present")
         };
+        profile::record_elapsed("preview.queue_wait", request.queued_at, || {
+            serde_json::json!({
+                "generation": request.generation,
+                "item_id": request.item.id,
+            })
+        });
+        let preview = profile::span("preview.fallback", || {
+            serde_json::json!({
+                "generation": request.generation,
+                "item_id": request.item.id,
+                "pane_id": request.item.preview_pane,
+            })
+        });
         let result = match (&request.item.preview_pane, &request.item.target) {
             (Some(pane), _) => client.snapshot(pane).map_err(|error| error.to_string()),
             (None, crate::model::Target::Directory { path }) => {
@@ -123,6 +148,7 @@ fn preview_worker<R: Runner>(
             generation: request.generation,
             result,
         });
+        drop(preview);
     }
 }
 
@@ -279,6 +305,7 @@ mod tests {
             *slot.lock().unwrap() = Some(PreviewRequest {
                 generation,
                 item: test_item(),
+                queued_at: None,
             });
         }
         let pending = slot.lock().unwrap();

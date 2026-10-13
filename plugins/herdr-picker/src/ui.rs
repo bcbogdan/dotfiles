@@ -6,34 +6,43 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::model::{App, LoadState, PreviewState, Tab};
+use crate::profile;
 
 const STACKED_AT: u16 = 96;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let [body, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
-    let (left, right) = panels(body);
+    let (left, right) = panels(body, app.preview_mode.enabled());
     draw_left(frame, app, left);
-    draw_preview(frame, app, right);
+    if let Some(right) = right {
+        draw_preview(frame, app, right);
+    }
     frame.render_widget(Paragraph::new(footer_text(app, footer.width)).dim(), footer);
 }
 
-fn panels(area: Rect) -> (Rect, Rect) {
+fn panels(area: Rect, preview_enabled: bool) -> (Rect, Option<Rect>) {
+    if !preview_enabled {
+        return (area, None);
+    }
     if area.width < STACKED_AT {
         let [left, right] =
             Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
-        (left, right)
+        (left, Some(right))
     } else {
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)])
                 .areas(area);
-        (left, right)
+        (left, Some(right))
     }
 }
 
-pub fn preview_dimensions(area: Rect) -> (u16, u16) {
+pub fn preview_dimensions(area: Rect, preview_enabled: bool) -> (u16, u16) {
     let [body, _] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
-    let (_, preview) = panels(body);
+    let (_, preview) = panels(body, preview_enabled);
+    let Some(preview) = preview else {
+        return (1, 1);
+    };
     let inner = Block::bordered().inner(preview);
     (inner.width.max(1), inner.height.max(1))
 }
@@ -113,6 +122,13 @@ fn footer_text(app: &App, width: u16) -> String {
     } else {
         ""
     };
+    if app.tab == Tab::Zoxide {
+        return if width >= 65 {
+            format!(" {prefix}enter open  shift+enter worktree  ^p up  ^o sort  esc close")
+        } else {
+            format!(" {prefix}⇧Enter worktree  ^p  ^o  esc")
+        };
+    }
     let hints = if width >= 72 {
         "enter focus  ^p up  ^o sort  ←/→ tabs  ↑/↓ move  esc close"
     } else if width >= 45 {
@@ -165,10 +181,16 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn parse_ansi(ansi: &str, (columns, rows): (u16, u16)) -> Text<'static> {
+    let parse = profile::span("ui.parse_ansi", || {
+        serde_json::json!({
+            "bytes": ansi.len(),
+            "dimensions": [columns, rows],
+        })
+    });
     let mut parser = vt100::Parser::new(rows, columns, 0);
     parser.process(ansi.as_bytes());
     let screen = parser.screen();
-    Text::from(
+    let text = Text::from(
         (0..rows)
             .map(|row| {
                 let mut spans = Vec::new();
@@ -198,7 +220,9 @@ fn parse_ansi(ansi: &str, (columns, rows): (u16, u16)) -> Text<'static> {
                 Line::from(spans)
             })
             .collect::<Vec<_>>(),
-    )
+    );
+    drop(parse);
+    text
 }
 
 fn cell_style(cell: &vt100::Cell) -> Style {
@@ -282,10 +306,30 @@ mod tests {
 
     #[test]
     fn layout_switches_to_stacked_when_narrow() {
-        let (wide_left, wide_right) = panels(Rect::new(0, 0, 140, 30));
-        let (narrow_left, narrow_right) = panels(Rect::new(0, 0, 70, 30));
+        let (wide_left, wide_right) = panels(Rect::new(0, 0, 140, 30), true);
+        let (narrow_left, narrow_right) = panels(Rect::new(0, 0, 70, 30), true);
+        let wide_right = wide_right.unwrap();
+        let narrow_right = narrow_right.unwrap();
         assert_eq!(wide_left.y, wide_right.y);
         assert!(narrow_right.y > narrow_left.y);
+    }
+
+    #[test]
+    fn preview_off_gives_the_list_the_full_panel_and_renders_no_preview() {
+        let area = Rect::new(2, 3, 140, 30);
+        assert_eq!(panels(area, false), (area, None));
+
+        let mut app = app();
+        app.preview_mode = crate::model::PreviewMode::Off;
+        let screen = render_app(&app, 140, 30);
+        assert!(screen.contains("dotfiles"));
+        assert!(!screen.contains("Nothing to preview"));
+    }
+
+    #[test]
+    fn preview_dimensions_are_safe_when_preview_is_off() {
+        assert_eq!(preview_dimensions(Rect::new(0, 0, 0, 0), false), (1, 1));
+        assert_eq!(preview_dimensions(Rect::new(0, 0, 140, 30), false), (1, 1));
     }
 
     #[test]

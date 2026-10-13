@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::history::History;
+use crate::profile;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +145,26 @@ pub enum PreviewState {
     Error(String),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PreviewMode {
+    #[default]
+    Live,
+    Off,
+}
+
+impl PreviewMode {
+    pub fn enabled(self) -> bool {
+        self == Self::Live
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Off => "off",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TabState {
     pub query: String,
@@ -173,6 +194,7 @@ pub struct App {
     pub pending_prefix: bool,
     pub should_close: bool,
     pub warning: Option<String>,
+    pub preview_mode: PreviewMode,
     workspace_identity: Vec<Item>,
     history: History,
 }
@@ -188,6 +210,7 @@ impl App {
             pending_prefix: false,
             should_close: false,
             warning: None,
+            preview_mode: PreviewMode::Live,
             workspace_identity: Vec::new(),
             history: History::default(),
         }
@@ -203,6 +226,17 @@ impl App {
 
     pub fn filtered(&self) -> Vec<&Item> {
         let query = self.state().query.to_lowercase();
+        let filtered_span = profile::span("model.filtered", || {
+            serde_json::json!({
+                "query_bytes": query.len(),
+                "sort": self.state().sort.label(),
+                "source_items": match &self.state().source {
+                    LoadState::Ready(items) => items.len(),
+                    LoadState::Loading | LoadState::Error(_) => 0,
+                },
+                "tab": self.tab.label(),
+            })
+        });
         let mut filtered: Vec<_> = match &self.state().source {
             LoadState::Ready(items) => items
                 .iter()
@@ -235,7 +269,9 @@ impl App {
             };
             order.then_with(|| left_index.cmp(right_index))
         });
-        filtered.into_iter().map(|(_, item)| item).collect()
+        let result = filtered.into_iter().map(|(_, item)| item).collect();
+        drop(filtered_span);
+        result
     }
 
     pub fn selected(&self) -> Option<&Item> {
@@ -346,7 +382,10 @@ impl App {
 }
 
 pub fn canonicalish(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| normalize(path))
+    let canonicalize = profile::span("path.canonicalize", || serde_json::json!({ "path": path }));
+    let result = std::fs::canonicalize(path).unwrap_or_else(|_| normalize(path));
+    drop(canonicalize);
+    result
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -401,6 +440,16 @@ mod tests {
         app.state_mut().query = "dtf".into();
         app.reconcile_selection();
         assert_eq!(app.selected().unwrap().id, "one");
+    }
+
+    #[test]
+    fn preview_mode_defaults_to_live_and_off_disables_preview() {
+        assert_eq!(PreviewMode::default(), PreviewMode::Live);
+        assert_eq!(App::new(Tab::Workspaces).preview_mode, PreviewMode::Live);
+        assert!(PreviewMode::Live.enabled());
+        assert!(!PreviewMode::Off.enabled());
+        assert_eq!(PreviewMode::Live.label(), "live");
+        assert_eq!(PreviewMode::Off.label(), "off");
     }
 
     #[test]

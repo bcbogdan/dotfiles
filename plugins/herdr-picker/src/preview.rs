@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,26 +9,31 @@ use base64::Engine;
 use serde::Deserialize;
 
 use crate::model::{PreviewIdentity, PreviewState};
+use crate::profile;
 
 const MAX_FRAME_LINE: usize = 2 * 1024 * 1024;
-const FALLBACK_DELAY: Duration = Duration::from_millis(350);
+const FALLBACK_REQUEST_DELAY: Duration = Duration::from_millis(120);
 const MAX_FRAME_DIMENSION: u16 = 1_000;
 const MAX_FRAME_CELLS: u32 = 500_000;
 
 pub struct LivePreview {
     child: Option<Child>,
-    receiver: Option<Receiver<Result<String, String>>>,
+    pending: Option<Arc<Mutex<PendingLive>>>,
     identity: Option<PreviewIdentity>,
     dimensions: (u16, u16),
+    first_frame_at: Option<Instant>,
+    stream_active: bool,
 }
 
 impl LivePreview {
     pub fn new() -> Self {
         Self {
             child: None,
-            receiver: None,
+            pending: None,
             identity: None,
             dimensions: (0, 0),
+            first_frame_at: None,
+            stream_active: false,
         }
     }
 
@@ -37,39 +42,72 @@ impl LivePreview {
         identity: Option<&PreviewIdentity>,
         dimensions: (u16, u16),
     ) -> LiveStart {
-        if self.identity.as_ref() == identity && self.dimensions == dimensions {
-            return if self.child.is_some() {
-                LiveStart::Started
-            } else {
-                LiveStart::NotApplicable
-            };
+        if self.can_reuse(identity, dimensions) {
+            return LiveStart::Started;
         }
         self.stop();
         self.identity = identity.cloned();
         self.dimensions = dimensions;
+        self.first_frame_at = profile::timestamp();
         let Some(target) = identity.and_then(|identity| identity.preview_pane.as_deref()) else {
             return LiveStart::NotApplicable;
         };
         match start(target, dimensions) {
-            Ok((child, receiver)) => {
+            Ok((child, pending)) => {
                 self.child = Some(child);
-                self.receiver = Some(receiver);
+                self.pending = Some(pending);
+                self.stream_active = true;
                 LiveStart::Started
             }
             Err(error) => LiveStart::Unavailable(error),
         }
     }
 
-    pub fn poll(&self) -> Option<Result<String, String>> {
-        self.receiver.as_ref()?.try_recv().ok()
+    pub fn poll(&mut self) -> Option<Result<String, String>> {
+        let frame = self.pending.as_ref()?.lock().ok()?.take()?;
+        profile::record_elapsed("preview.frame_delivery", frame.ready_at, || {
+            serde_json::json!({
+                "dimensions": [self.dimensions.0, self.dimensions.1],
+                "item_id": self.identity.as_ref().map(|identity| identity.item_id.as_str()),
+            })
+        });
+        let result = frame.result;
+        if result.is_err() {
+            self.stream_active = false;
+        }
+        profile::record_elapsed("preview.first_frame", self.first_frame_at.take(), || {
+            serde_json::json!({
+                "dimensions": [self.dimensions.0, self.dimensions.1],
+                "item_id": self.identity.as_ref().map(|identity| identity.item_id.as_str()),
+                "success": result.is_ok(),
+            })
+        });
+        Some(result)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.child.is_some() && self.stream_active
+    }
+
+    fn can_reuse(&self, identity: Option<&PreviewIdentity>, dimensions: (u16, u16)) -> bool {
+        self.identity.as_ref() == identity && self.dimensions == dimensions && self.is_active()
     }
 
     fn stop(&mut self) {
+        let stop = profile::span("preview.observer_stop", || {
+            serde_json::json!({
+                "item_id": self.identity.as_ref().map(|identity| identity.item_id.as_str()),
+                "running": self.child.is_some(),
+            })
+        });
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        self.receiver = None;
+        self.pending = None;
+        self.first_frame_at = None;
+        self.stream_active = false;
+        drop(stop);
     }
 }
 
@@ -98,7 +136,8 @@ pub struct Arbiter {
     generation: u64,
     started_at: Instant,
     live: LiveState,
-    fallback: Option<Result<String, String>>,
+    fallback_requested: bool,
+    fallback_visible: bool,
 }
 
 impl Arbiter {
@@ -107,14 +146,16 @@ impl Arbiter {
             generation: 0,
             started_at: Instant::now(),
             live: LiveState::NotApplicable,
-            fallback: None,
+            fallback_requested: false,
+            fallback_visible: false,
         }
     }
 
     pub fn reset(&mut self, generation: u64, start: &LiveStart, now: Instant) {
         self.generation = generation;
         self.started_at = now;
-        self.fallback = None;
+        self.fallback_requested = false;
+        self.fallback_visible = false;
         self.live = match start {
             LiveStart::Started => LiveState::Waiting,
             LiveStart::NotApplicable => LiveState::NotApplicable,
@@ -126,20 +167,24 @@ impl Arbiter {
         &mut self,
         generation: u64,
         result: Result<String, String>,
-        now: Instant,
     ) -> Option<PreviewState> {
         if generation != self.generation || self.live == LiveState::Ready {
             return None;
         }
-        self.fallback = Some(result);
-        self.release_fallback(now)
+        match result {
+            Ok(snapshot) => {
+                self.fallback_visible = true;
+                Some(PreviewState::Ready(snapshot))
+            }
+            Err(error) => Some(PreviewState::Error(error)),
+        }
     }
 
     pub fn live(&mut self, result: Result<String, String>) -> Option<PreviewState> {
         match result {
             Ok(frame) => {
                 self.live = LiveState::Ready;
-                self.fallback = None;
+                self.fallback_visible = false;
                 Some(PreviewState::Ready(frame))
             }
             Err(error) => {
@@ -147,33 +192,50 @@ impl Arbiter {
                     return None;
                 }
                 self.live = LiveState::Unavailable;
-                self.release_fallback(Instant::now())
-                    .or(Some(PreviewState::Error(error)))
+                (!self.fallback_visible).then_some(PreviewState::Error(error))
             }
         }
     }
 
-    pub fn tick(&mut self, now: Instant) -> Option<PreviewState> {
-        self.release_fallback(now)
-    }
-
-    fn release_fallback(&mut self, now: Instant) -> Option<PreviewState> {
-        let due = self.live != LiveState::Waiting
-            || now.saturating_duration_since(self.started_at) >= FALLBACK_DELAY;
-        if !due {
-            return None;
+    pub fn fallback_due(&mut self, now: Instant) -> bool {
+        if self.fallback_requested || self.live == LiveState::Ready {
+            return false;
         }
-        self.fallback
-            .take()
-            .map(|result| result.map_or_else(PreviewState::Error, PreviewState::Ready))
+        let due = self.live != LiveState::Waiting
+            || now.saturating_duration_since(self.started_at) >= FALLBACK_REQUEST_DELAY;
+        self.fallback_requested = due;
+        due
+    }
+}
+
+struct LiveFrame {
+    result: Result<String, String>,
+    ready_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct PendingLive {
+    frame: Option<LiveFrame>,
+    terminal: Option<LiveFrame>,
+}
+
+impl PendingLive {
+    fn take(&mut self) -> Option<LiveFrame> {
+        self.frame.take().or_else(|| self.terminal.take())
     }
 }
 
 fn start(
     target: &str,
     (columns, rows): (u16, u16),
-) -> Result<(Child, Receiver<Result<String, String>>), String> {
+) -> Result<(Child, Arc<Mutex<PendingLive>>), String> {
     let herdr = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let spawn = profile::span("preview.observer_spawn", || {
+        serde_json::json!({
+            "target": target,
+            "dimensions": [columns, rows],
+        })
+    });
     let mut child = Command::new(herdr)
         .args(["terminal", "session", "observe", target, "--cols"])
         .arg(columns.to_string())
@@ -184,11 +246,13 @@ fn start(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("live preview unavailable: {error}"))?;
+    drop(spawn);
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| "live preview stdout unavailable".to_string())?;
-    let (tx, rx) = mpsc::sync_channel(2);
+    let pending = Arc::new(Mutex::new(PendingLive::default()));
+    let observer_pending = Arc::clone(&pending);
     thread::Builder::new()
         .name("herdr-picker-observer".into())
         .spawn(move || {
@@ -199,32 +263,71 @@ fn start(
                 line.clear();
                 match read_limited_line(&mut reader, &mut line) {
                     Ok(0) => {
-                        let _ = tx.try_send(Err("live preview stream ended".into()));
+                        publish(
+                            &observer_pending,
+                            LiveFrame {
+                                result: Err("live preview stream ended".into()),
+                                ready_at: profile::timestamp(),
+                            },
+                        );
                         break;
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        let _ = tx.try_send(Err(error));
+                        publish(
+                            &observer_pending,
+                            LiveFrame {
+                                result: Err(error),
+                                ready_at: profile::timestamp(),
+                            },
+                        );
                         break;
                     }
                 }
-                let result = serde_json::from_slice::<Record<'_>>(&line)
-                    .map_err(|error| error.to_string())
-                    .and_then(|record| state.apply(&record));
+                let decode = profile::span(
+                    "preview.frame_json",
+                    || serde_json::json!({ "bytes": line.len() }),
+                );
+                let record =
+                    serde_json::from_slice::<Record<'_>>(&line).map_err(|error| error.to_string());
+                drop(decode);
+                let result = record.and_then(|record| state.apply(&record));
                 match result {
                     Ok(Some(ansi)) => {
-                        let _ = tx.try_send(Ok(ansi));
+                        publish(
+                            &observer_pending,
+                            LiveFrame {
+                                result: Ok(ansi),
+                                ready_at: profile::timestamp(),
+                            },
+                        );
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        let _ = tx.try_send(Err(error));
+                        publish(
+                            &observer_pending,
+                            LiveFrame {
+                                result: Err(error),
+                                ready_at: profile::timestamp(),
+                            },
+                        );
                         break;
                     }
                 }
             }
         })
         .map_err(|error| error.to_string())?;
-    Ok((child, rx))
+    Ok((child, pending))
+}
+
+fn publish(pending: &Mutex<PendingLive>, frame: LiveFrame) {
+    if let Ok(mut pending) = pending.lock() {
+        if frame.result.is_ok() {
+            pending.frame = Some(frame);
+        } else {
+            pending.terminal = Some(frame);
+        }
+    }
 }
 
 fn read_limited_line(reader: &mut impl BufRead, output: &mut Vec<u8>) -> Result<usize, String> {
@@ -323,14 +426,37 @@ impl StreamState {
             .parser
             .as_mut()
             .ok_or_else(|| "incremental frame before full frame".to_string())?;
+        let decode = profile::span("preview.frame_base64", || {
+            serde_json::json!({
+                "encoded_bytes": frame.bytes.map_or(0, str::len),
+                "full": frame.full,
+                "sequence": frame.sequence,
+            })
+        });
         let bytes = STANDARD
             .decode(frame.bytes.unwrap_or_default())
             .map_err(|error| error.to_string())?;
+        drop(decode);
+        let process = profile::span("preview.frame_vt100", || {
+            serde_json::json!({
+                "bytes": bytes.len(),
+                "dimensions": [frame.width, frame.height],
+                "full": frame.full,
+                "sequence": frame.sequence,
+            })
+        });
         parser.process(&bytes);
+        drop(process);
         self.last_sequence = Some(frame.sequence);
-        Ok(Some(
-            String::from_utf8_lossy(&parser.screen().contents_formatted()).into_owned(),
-        ))
+        let serialize = profile::span("preview.frame_serialize", || {
+            serde_json::json!({
+                "dimensions": [frame.width, frame.height],
+                "sequence": frame.sequence,
+            })
+        });
+        let formatted = String::from_utf8_lossy(&parser.screen().contents_formatted()).into_owned();
+        drop(serialize);
+        Ok(Some(formatted))
     }
 }
 
@@ -392,31 +518,106 @@ mod tests {
     }
 
     #[test]
-    fn live_frame_wins_over_earlier_or_later_fallback() {
+    fn fallback_becomes_due_at_120ms_exactly_once() {
         let now = Instant::now();
         let mut arbiter = Arbiter::new();
         arbiter.reset(1, &LiveStart::Started, now);
-        assert_eq!(arbiter.fallback(1, Ok("snapshot".into()), now), None);
+
+        assert!(!arbiter.fallback_due(now));
+        assert!(!arbiter.fallback_due(
+            (now + FALLBACK_REQUEST_DELAY)
+                .checked_sub(Duration::from_millis(1))
+                .unwrap()
+        ));
+        assert!(arbiter.fallback_due(now + FALLBACK_REQUEST_DELAY));
+        assert!(!arbiter.fallback_due(now + FALLBACK_REQUEST_DELAY + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn fallback_result_is_released_immediately_after_arrival() {
+        let now = Instant::now();
+        let mut arbiter = Arbiter::new();
+        arbiter.reset(3, &LiveStart::Started, now);
+
         assert_eq!(
-            arbiter.live(Ok("live".into())),
-            Some(PreviewState::Ready("live".into()))
-        );
-        assert_eq!(
-            arbiter.fallback(1, Ok("late snapshot".into()), now + FALLBACK_DELAY),
-            None
+            arbiter.fallback(3, Ok("snapshot".into())),
+            Some(PreviewState::Ready("snapshot".into()))
         );
     }
 
     #[test]
-    fn fallback_waits_for_deadline_when_live_has_no_first_frame() {
+    fn live_error_does_not_replace_a_visible_fallback() {
         let now = Instant::now();
         let mut arbiter = Arbiter::new();
         arbiter.reset(3, &LiveStart::Started, now);
-        assert_eq!(arbiter.fallback(3, Ok("snapshot".into()), now), None);
         assert_eq!(
-            arbiter.tick(now + FALLBACK_DELAY),
+            arbiter.fallback(3, Ok("snapshot".into())),
             Some(PreviewState::Ready("snapshot".into()))
         );
+        assert_eq!(arbiter.live(Err("observer ended".into())), None);
+    }
+
+    #[test]
+    fn pending_live_keeps_latest_frame_and_terminal_notification() {
+        let pending = Mutex::new(PendingLive::default());
+        publish(
+            &pending,
+            LiveFrame {
+                result: Ok("first".into()),
+                ready_at: None,
+            },
+        );
+        publish(
+            &pending,
+            LiveFrame {
+                result: Ok("latest".into()),
+                ready_at: None,
+            },
+        );
+        publish(
+            &pending,
+            LiveFrame {
+                result: Err("ended".into()),
+                ready_at: None,
+            },
+        );
+
+        let mut pending = pending.lock().unwrap();
+        assert_eq!(pending.take().unwrap().result, Ok("latest".into()));
+        assert_eq!(pending.take().unwrap().result, Err("ended".into()));
+        assert!(pending.take().is_none());
+    }
+
+    #[test]
+    fn inactive_observer_is_not_reusable() {
+        let preview = LivePreview {
+            child: None,
+            pending: None,
+            identity: Some(PreviewIdentity {
+                item_id: "w1".into(),
+                preview_pane: Some("w1:p1".into()),
+                target: crate::model::Target::Workspace { id: "w1".into() },
+            }),
+            dimensions: (80, 24),
+            first_frame_at: None,
+            stream_active: false,
+        };
+        assert!(!preview.is_active());
+        assert!(!preview.can_reuse(preview.identity.as_ref(), (80, 24)));
+    }
+
+    #[test]
+    fn live_frame_wins_over_a_later_fallback_result() {
+        let now = Instant::now();
+        let mut arbiter = Arbiter::new();
+        arbiter.reset(1, &LiveStart::Started, now);
+
+        assert_eq!(
+            arbiter.live(Ok("live".into())),
+            Some(PreviewState::Ready("live".into()))
+        );
+        assert_eq!(arbiter.fallback(1, Ok("late snapshot".into())), None);
+        assert!(!arbiter.fallback_due(now + FALLBACK_REQUEST_DELAY));
     }
 
     #[test]

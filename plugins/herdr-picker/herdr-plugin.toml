@@ -20,6 +20,18 @@ title = "Open unified picker on agents"
 contexts = ["workspace", "pane"]
 command = ["./target/release/herdr-picker", "--open", "agents"]
 
+[[actions]]
+id = "open-workspaces-no-preview"
+title = "Open unified picker on workspaces without preview"
+contexts = ["workspace", "pane"]
+command = ["./target/release/herdr-picker", "--open", "workspaces", "--preview", "off"]
+
+[[actions]]
+id = "open-agents-no-preview"
+title = "Open unified picker on agents without preview"
+contexts = ["workspace", "pane"]
+command = ["./target/release/herdr-picker", "--open", "agents", "--preview", "off"]
+
 [[panes]]
 id = "picker"
 title = "Picker"

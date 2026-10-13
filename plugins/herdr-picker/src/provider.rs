@@ -12,6 +12,7 @@ use serde_json::Value;
 use wait_timeout::ChildExt;
 
 use crate::model::{canonicalish, Item, Target};
+use crate::profile;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
 const OUTPUT_LIMIT: usize = 512 * 1024;
@@ -44,6 +45,13 @@ impl Runner for SystemRunner {
     fn run(&self, program: &OsStr, args: &[OsString], timeout: Duration) -> Result<String, Error> {
         let name = program.to_string_lossy().into_owned();
         let invocation = format_invocation(program, args);
+        let command_span = profile::span("command.run", || {
+            serde_json::json!({
+                "program": name,
+                "args": args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
+                "timeout_ms": timeout.as_millis(),
+            })
+        });
         let mut stdout = capture_file().map_err(|source| Error::Spawn {
             program: name.clone(),
             source,
@@ -53,6 +61,7 @@ impl Runner for SystemRunner {
             source,
         })?;
         // Files avoid inherited-pipe hangs; timed-out grandchildren may still exit later.
+        let spawn = profile::span("command.spawn", || serde_json::json!({ "program": name }));
         let mut command = Command::new(program);
         command
             .args(args)
@@ -76,6 +85,8 @@ impl Runner for SystemRunner {
             program: name.clone(),
             source,
         })?;
+        drop(spawn);
+        let wait = profile::span("command.wait", || serde_json::json!({ "program": name }));
         if child
             .wait_timeout(timeout)
             .map_err(|source| Error::Spawn {
@@ -88,10 +99,15 @@ impl Runner for SystemRunner {
             let _ = child.wait();
             return Err(Error::Timeout { program: name });
         }
+        drop(wait);
         let status = child.wait().map_err(|source| Error::Spawn {
             program: name.clone(),
             source,
         })?;
+        let read = profile::span(
+            "command.read_output",
+            || serde_json::json!({ "program": name }),
+        );
         let stdout = read_tail(&mut stdout).map_err(|source| Error::Spawn {
             program: name.clone(),
             source,
@@ -100,6 +116,7 @@ impl Runner for SystemRunner {
             program: name.clone(),
             source,
         })?;
+        drop(read);
         if !status.success() {
             let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
             let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
@@ -125,7 +142,9 @@ impl Runner for SystemRunner {
                 message,
             });
         }
-        Ok(String::from_utf8_lossy(&stdout).into_owned())
+        let output = String::from_utf8_lossy(&stdout).into_owned();
+        drop(command_span);
+        Ok(output)
     }
 }
 
@@ -169,6 +188,10 @@ impl<R: Runner> Client<R> {
     }
 
     pub fn load(&self, self_pane: Option<&str>) -> [Result<Vec<Item>, String>; 3] {
+        let load = profile::span(
+            "refresh.load",
+            || serde_json::json!({ "self_pane": self_pane }),
+        );
         let workspaces = self
             .herdr(&["workspace", "list"])
             .and_then(|raw| parse_workspaces(&raw));
@@ -201,7 +224,9 @@ impl<R: Runner> Client<R> {
             }
             Err(error) => Err(error.to_string()),
         };
-        [workspace_source, agent_source, zoxide_source]
+        let result = [workspace_source, agent_source, zoxide_source];
+        drop(load);
+        result
     }
 
     pub fn snapshot(&self, pane: &str) -> Result<String, Error> {
@@ -503,6 +528,7 @@ fn sensible_label(path: &Path) -> String {
 }
 
 pub fn directory_summary<R: Runner>(runner: &R, path: &Path) -> Result<String, Error> {
+    let directory = profile::span("preview.directory", || serde_json::json!({ "path": path }));
     let mut summary = format!("{}\n", path.display());
     let git_args = vec![
         OsString::from("-C"),
@@ -537,6 +563,7 @@ pub fn directory_summary<R: Runner>(runner: &R, path: &Path) -> Result<String, E
         };
         let _ = writeln!(summary, "{}{}", entry.file_name().to_string_lossy(), suffix);
     }
+    drop(directory);
     Ok(summary)
 }
 

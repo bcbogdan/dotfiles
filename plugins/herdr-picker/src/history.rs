@@ -8,6 +8,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{HistoryKey, Item};
+use crate::profile;
 
 const VERSION: u8 = 1;
 // Retain six months of inactive history, capped at 2,048; visible items are exempt.
@@ -234,9 +235,20 @@ impl FileStore {
         let lock_path = parent.join(".picker-history.lock");
         let lock = secure_open(&lock_path, false)?;
         secure_file_permissions(&lock_path)?;
+        let wait = profile::span(
+            "history.lock_wait",
+            || serde_json::json!({ "path": lock_path }),
+        );
         lock.lock_exclusive().map_err(|error| error.to_string())?;
+        drop(wait);
+        let locked = profile::span(
+            "history.locked_operation",
+            || serde_json::json!({ "path": path }),
+        );
         cleanup_stale_temps(parent);
-        operation(path, parent)
+        let result = operation(path, parent);
+        drop(locked);
+        result
     }
 }
 
@@ -351,13 +363,24 @@ fn write_atomic(
     history: &History,
     logical_time: u64,
 ) -> Result<(), String> {
+    let write = profile::span(
+        "history.write_atomic",
+        || serde_json::json!({ "entries": history.entries.len(), "path": path }),
+    );
     let temporary = unique_path(parent, TEMP_PREFIX);
     let result = (|| {
         let mut file = secure_open(&temporary, true)?;
         serde_json::to_writer(&mut file, &Document::from_history(history, logical_time))
             .map_err(|error| error.to_string())?;
         file.write_all(b"\n").map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
+        {
+            let sync = profile::span(
+                "history.file_sync",
+                || serde_json::json!({ "path": temporary }),
+            );
+            file.sync_all().map_err(|error| error.to_string())?;
+            drop(sync);
+        }
         fs::rename(&temporary, path).map_err(|error| error.to_string())?;
         secure_file_permissions(path)?;
         sync_directory(parent)
@@ -365,6 +388,7 @@ fn write_atomic(
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
+    drop(write);
     result
 }
 
@@ -399,9 +423,15 @@ fn cleanup_stale_temps(parent: &Path) {
 }
 
 fn sync_directory(path: &Path) -> Result<(), String> {
-    File::open(path)
+    let sync = profile::span(
+        "history.directory_sync",
+        || serde_json::json!({ "path": path }),
+    );
+    let result = File::open(path)
         .and_then(|directory| directory.sync_all())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    drop(sync);
+    result
 }
 
 #[cfg(unix)]

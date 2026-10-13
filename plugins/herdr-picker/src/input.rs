@@ -11,6 +11,7 @@ pub enum Effect {
     None,
     SelectionChanged,
     Confirm,
+    CreateWorktree,
     Close,
 }
 
@@ -23,18 +24,20 @@ impl Reducer {
         Self { prefix_at: None }
     }
 
-    pub fn expire_prefix(&mut self, app: &mut App, now: Instant) {
+    pub fn expire_prefix(&mut self, app: &mut App, now: Instant) -> bool {
         if self
             .prefix_at
             .is_some_and(|at| now.duration_since(at) >= PREFIX_TIMEOUT)
         {
             self.prefix_at = None;
             app.pending_prefix = false;
+            return true;
         }
+        false
     }
 
     pub fn key(&mut self, app: &mut App, key: KeyEvent, now: Instant) -> Effect {
-        self.expire_prefix(app, now);
+        let _ = self.expire_prefix(app, now);
         if is_prefix(key) {
             self.prefix_at = Some(now);
             app.pending_prefix = true;
@@ -64,6 +67,10 @@ impl Reducer {
             }
             return Effect::None;
         }
+        Self::picker_key(app, key)
+    }
+
+    fn picker_key(app: &mut App, key: KeyEvent) -> Effect {
         if let Some(shortcut) = control_shortcut(key) {
             return match shortcut {
                 'c' => {
@@ -102,6 +109,17 @@ impl Reducer {
             KeyCode::Esc => {
                 app.should_close = true;
                 Effect::Close
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if app.tab == Tab::Zoxide
+                    && app.selected().is_some_and(|item| {
+                        matches!(item.target, crate::model::Target::Directory { .. })
+                    })
+                {
+                    Effect::CreateWorktree
+                } else {
+                    Effect::None
+                }
             }
             KeyCode::Enter => Effect::Confirm,
             KeyCode::Left => {
@@ -182,6 +200,30 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(app.state().query, "x");
+    }
+
+    #[test]
+    fn shift_enter_only_creates_for_selected_zoxide_directory_and_preserves_query() {
+        let mut reducer = Reducer::new();
+        let mut app = App::new(Tab::Zoxide);
+        let now = Instant::now();
+        let shifted = key(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(reducer.key(&mut app, shifted, now), Effect::None);
+        let mut item = test_item("repo");
+        item.target = crate::model::Target::Directory {
+            path: "/repo".into(),
+        };
+        app.set_items(Tab::Zoxide, vec![item]);
+        app.state_mut().query = "repo".into();
+        app.reconcile_selection();
+        assert_eq!(reducer.key(&mut app, shifted, now), Effect::CreateWorktree);
+        assert_eq!(app.state().query, "repo");
+        assert_eq!(
+            reducer.key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE), now),
+            Effect::Confirm
+        );
+        app.switch_tab(Tab::Workspaces);
+        assert_eq!(reducer.key(&mut app, shifted, now), Effect::None);
     }
 
     #[test]
@@ -293,6 +335,25 @@ mod tests {
         );
         assert_eq!(app.state().query, "s");
         assert!(!app.pending_prefix);
+    }
+
+    #[test]
+    fn expire_prefix_reports_only_the_timeout_transition() {
+        let now = Instant::now();
+        let mut reducer = Reducer::new();
+        let mut app = App::new(Tab::Workspaces);
+        reducer.key(&mut app, key(KeyCode::Null, KeyModifiers::NONE), now);
+
+        assert!(!reducer.expire_prefix(
+            &mut app,
+            (now + PREFIX_TIMEOUT)
+                .checked_sub(Duration::from_millis(1))
+                .unwrap()
+        ));
+        assert!(app.pending_prefix);
+        assert!(reducer.expire_prefix(&mut app, now + PREFIX_TIMEOUT));
+        assert!(!app.pending_prefix);
+        assert!(!reducer.expire_prefix(&mut app, now + PREFIX_TIMEOUT));
     }
 
     #[test]
