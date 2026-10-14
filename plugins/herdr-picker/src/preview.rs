@@ -49,7 +49,10 @@ impl LivePreview {
         self.identity = identity.cloned();
         self.dimensions = dimensions;
         self.first_frame_at = profile::timestamp();
-        let Some(target) = identity.and_then(|identity| identity.preview_pane.as_deref()) else {
+        let Some(target) = identity
+            .filter(|identity| identity.target.machine().is_none())
+            .and_then(|identity| identity.preview_pane.as_deref())
+        else {
             return LiveStart::NotApplicable;
         };
         match start(target, dimensions) {

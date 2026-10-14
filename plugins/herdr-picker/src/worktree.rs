@@ -11,6 +11,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
+use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
 
 use crate::model::{Item, Target};
@@ -69,14 +70,14 @@ fn read_git(runner: &impl Runner, repo: &Path, args: &[&str]) -> Result<String, 
     )
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Branch {
     reference: String,
     label: String,
 }
 
-#[derive(Clone, Debug)]
-struct Repository {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Repository {
     root: PathBuf,
     branches: Vec<Branch>,
     current: Option<usize>,
@@ -191,8 +192,8 @@ fn expand_path(value: &str, parent: &Path) -> Result<PathBuf, String> {
     })
 }
 
-#[derive(Clone, Debug)]
-struct Plan {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Plan {
     repo: PathBuf,
     name: String,
     commit: String,
@@ -228,6 +229,7 @@ fn reconcile(runner: &impl Runner, plan: &Plan) -> Result<(), String> {
     Err("Creation could not be confirmed. Inspect `git worktree list`, the destination, and the new branch before retrying. No files or branches were removed.".into())
 }
 
+#[derive(Serialize, Deserialize)]
 enum Creation {
     Created,
     Invalid(String),
@@ -256,6 +258,108 @@ fn create(runner: &impl Runner, plan: &Plan) -> Creation {
             Ok(()) => Creation::Created,
             Err(detail) => Creation::Uncertain(format!("{error}\n{detail}")),
         },
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum Operation {
+    ListCompletion {
+        text: String,
+        parent: PathBuf,
+    },
+    Discover(PathBuf),
+    Name {
+        root: PathBuf,
+        name: String,
+    },
+    Resolve {
+        root: PathBuf,
+        reference: String,
+    },
+    Destination {
+        plan: Plan,
+        value: String,
+        parent: PathBuf,
+    },
+    Create(Plan),
+    Reconcile(Plan),
+    Complete {
+        text: String,
+        parent: PathBuf,
+        zoxide: Vec<PathBuf>,
+    },
+}
+
+pub fn execute(operation: Operation) -> Result<serde_json::Value, String> {
+    match operation {
+        Operation::ListCompletion { text, parent } => {
+            let (directory, _) =
+                completion_directory(&text, &parent).ok_or("Invalid completion directory")?;
+            serde_json::to_value(scan_directory(&directory)?)
+        }
+        Operation::Discover(path) => serde_json::to_value(discover(&SystemRunner, &path)?),
+        Operation::Name { root, name } => {
+            serde_json::to_value(validate_name(&SystemRunner, &root, &name)?)
+        }
+        Operation::Resolve { root, reference } => {
+            serde_json::to_value(resolve(&SystemRunner, &root, &reference)?)
+        }
+        Operation::Destination {
+            mut plan,
+            value,
+            parent,
+        } => {
+            plan.destination = absolute_destination(&expand_path(&value, &parent)?)?;
+            validate_destination(&plan)?;
+            serde_json::to_value(plan)
+        }
+        Operation::Create(plan) => serde_json::to_value(create(&SystemRunner, &plan)),
+        Operation::Reconcile(plan) => serde_json::to_value(reconcile(&SystemRunner, &plan)?),
+        Operation::Complete {
+            text,
+            parent,
+            zoxide,
+        } => {
+            let values = if let Some((directory, query)) = completion_directory(&text, &parent) {
+                filter_directories(&query, &scan_directory(&directory)?)
+            } else {
+                complete_zoxide(&text, &zoxide)
+            };
+            serde_json::to_value(values)
+        }
+    }
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Default)]
+struct Backend {
+    machine: Option<crate::machine::Machine>,
+    remote: Arc<std::sync::Mutex<Option<crate::machine::Remote>>>,
+}
+
+impl Backend {
+    fn run<T: for<'de> Deserialize<'de>>(&self, operation: Operation) -> Result<T, String> {
+        self.run_with(&SystemRunner, operation)
+    }
+
+    fn run_with<T: for<'de> Deserialize<'de>>(
+        &self,
+        runner: &impl Runner,
+        operation: Operation,
+    ) -> Result<T, String> {
+        if let Some(machine) = &self.machine {
+            crate::machine::validate_profile(runner, machine)?;
+            let remote = {
+                let mut cache = self.remote.lock().map_err(|error| error.to_string())?;
+                if cache.is_none() {
+                    *cache = Some(crate::machine::Remote::discover(runner, machine)?);
+                }
+                cache.clone().unwrap()
+            };
+            remote.call_with(runner, crate::machine::Operation::Worktree(operation))
+        } else {
+            serde_json::from_value(execute(operation)?).map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -350,7 +454,24 @@ fn spawn<T: Send + 'static>(operation: impl FnOnce() -> T + Send + 'static) -> R
     receiver
 }
 
+enum CompletionValues {
+    Directory(Vec<PathBuf>),
+    Suggestions(Vec<String>),
+}
+type RemoteCompletion = (String, Result<CompletionValues, String>);
+
+fn opaque_completion_key(text: &str) -> Option<(PathBuf, String)> {
+    if text == "~" {
+        return Some(("~/".into(), String::new()));
+    }
+    let (directory, query) = text.rsplit_once('/')?;
+    Some((format!("{directory}/").into(), query.into()))
+}
+
 pub struct Flow {
+    backend: Backend,
+    remote_completion: Option<Receiver<RemoteCompletion>>,
+    remote_completed: Option<String>,
     step: Step,
     repo: Option<Repository>,
     name: Editor,
@@ -377,8 +498,30 @@ pub enum Action {
 }
 
 impl Flow {
+    #[cfg(test)]
     pub fn new(source: PathBuf, zoxide: Vec<PathBuf>, completion_gate: CompletionGate) -> Self {
+        Self::on_host(source, zoxide, completion_gate, None)
+    }
+
+    pub fn machine(&self) -> Option<&crate::machine::Machine> {
+        self.backend.machine.as_ref()
+    }
+
+    pub fn on_host(
+        source: PathBuf,
+        zoxide: Vec<PathBuf>,
+        completion_gate: CompletionGate,
+        machine: Option<crate::machine::Machine>,
+    ) -> Self {
+        let backend = Backend {
+            machine,
+            ..Backend::default()
+        };
+        let worker = backend.clone();
         Self {
+            backend,
+            remote_completion: None,
+            remote_completed: None,
             step: Step::Loading,
             repo: None,
             name: Editor::default(),
@@ -389,7 +532,7 @@ impl Flow {
             plan: None,
             error: None,
             job: Some(spawn(move || {
-                Reply::Repository(discover(&SystemRunner, &source))
+                Reply::Repository(worker.run(Operation::Discover(source)))
             })),
             completion_job: None,
             completion_gate,
@@ -424,6 +567,19 @@ impl Flow {
     }
 
     fn refresh_completions(&mut self) {
+        if self.machine().is_some() {
+            if let Some((key, query)) = opaque_completion_key(&self.destination.text) {
+                self.completions = self
+                    .directory_cache
+                    .iter()
+                    .find(|entry| entry.directory == key)
+                    .and_then(|entry| entry.entries.as_ref().ok())
+                    .map_or_else(Vec::new, |entries| filter_directories(&query, entries));
+            } else if self.remote_completed.as_ref() != Some(&self.destination.text) {
+                self.completions.clear();
+            }
+            return;
+        }
         self.completions = if self.step != Step::Destination {
             Vec::new()
         } else if let Some((directory, query)) =
@@ -440,6 +596,9 @@ impl Flow {
     }
 
     pub fn awaiting_worker(&self) -> bool {
+        if self.machine().is_some() {
+            return self.job.is_some() || self.remote_completion.is_some();
+        }
         self.job.is_some()
             || self.completion_job.is_some()
             || (self.step == Step::Destination
@@ -509,6 +668,9 @@ impl Flow {
                 }
             }
         }
+        if self.machine().is_some() {
+            return self.poll_remote_completion() || changed;
+        }
         if let Some(listing) = self
             .completion_job
             .as_ref()
@@ -555,6 +717,96 @@ impl Flow {
         changed
     }
 
+    fn poll_remote_completion(&mut self) -> bool {
+        let mut changed = false;
+        self.directory_cache.retain(|entry| {
+            entry.entries.is_ok() || entry.scanned.elapsed() < Duration::from_secs(1)
+        });
+        if let Some((text, result)) = self
+            .remote_completion
+            .as_ref()
+            .and_then(|job| job.try_recv().ok())
+        {
+            self.remote_completion = None;
+            if let Some((directory, _)) = opaque_completion_key(&text) {
+                if self.directory_cache.len() == DIRECTORY_CACHE_LIMIT {
+                    self.directory_cache.pop_front();
+                }
+                let entries = match result {
+                    Ok(CompletionValues::Directory(entries)) => Ok(entries),
+                    Ok(CompletionValues::Suggestions(_)) => {
+                        Err("Unexpected completion response".into())
+                    }
+                    Err(error) => Err(error),
+                };
+                if text == self.destination.text {
+                    if let Err(error) = &entries {
+                        self.error = Some(format!("Completion: {error}"));
+                    }
+                }
+                self.directory_cache.push_back(DirectoryListing {
+                    directory,
+                    entries,
+                    scanned: Instant::now(),
+                });
+                self.refresh_completions();
+                changed = true;
+            } else if self.step == Step::Destination && text == self.destination.text {
+                self.remote_completed = Some(text);
+                match result {
+                    Ok(CompletionValues::Suggestions(values)) => self.completions = values,
+                    Ok(CompletionValues::Directory(_)) => {
+                        self.error = Some("Unexpected completion response".into());
+                    }
+                    Err(error) => {
+                        self.completions.clear();
+                        self.error = Some(format!("Completion: {error}"));
+                    }
+                }
+                changed = true;
+            }
+        }
+        let cached = opaque_completion_key(&self.destination.text).is_some_and(|(key, _)| {
+            self.directory_cache
+                .iter()
+                .any(|entry| entry.directory == key)
+        });
+        if self.step == Step::Destination
+            && self.remote_completion.is_none()
+            && !cached
+            && self.remote_completed.as_ref() != Some(&self.destination.text)
+        {
+            let Some(permit) = self.completion_gate.acquire() else {
+                return changed;
+            };
+            let backend = self.backend.clone();
+            let text = self.destination.text.clone();
+            let parent = self.parent().to_path_buf();
+            let zoxide = self.zoxide.to_vec();
+            self.remote_completion = Some(spawn(move || {
+                let _permit = permit;
+                let result = if opaque_completion_key(&text).is_some() {
+                    backend
+                        .run(Operation::ListCompletion {
+                            text: text.clone(),
+                            parent,
+                        })
+                        .map(CompletionValues::Directory)
+                } else {
+                    backend
+                        .run(Operation::Complete {
+                            text: text.clone(),
+                            parent,
+                            zoxide,
+                        })
+                        .map(CompletionValues::Suggestions)
+                };
+                (text, result)
+            }));
+        }
+        changed
+    }
+
     pub fn start_open<R: Runner + Clone + 'static>(
         &mut self,
         client: &Client<R>,
@@ -567,9 +819,23 @@ impl Flow {
         let retry = self.retry_open;
         let client = client.clone();
         let workspaces = workspaces.to_vec();
+        let machine = self.backend.machine.clone();
         self.job = Some(spawn(move || {
-            let workspaces = if retry {
-                match client.load(None).into_iter().next().unwrap() {
+            let pending = machine
+                .as_ref()
+                .is_some_and(|machine| client.has_pending_workspace(machine, &destination));
+            let workspaces = if retry && !pending {
+                let sources = if let Some(machine) = &machine {
+                    match crate::machine::Remote::discover(&SystemRunner, machine)
+                        .and_then(|remote| remote.call(crate::machine::Operation::Load))
+                    {
+                        Ok(sources) => crate::machine::remote_items(machine, sources),
+                        Err(error) => return Reply::Open(Err(error)),
+                    }
+                } else {
+                    client.load(None)
+                };
+                match sources.into_iter().next().unwrap() {
                     Ok(items) => items,
                     Err(error) => {
                         return Reply::Open(Err(format!(
@@ -580,20 +846,32 @@ impl Flow {
             } else {
                 workspaces
             };
+            let mut target = Target::Directory {
+                path: destination.clone(),
+            };
+            if let Some(machine) = &machine {
+                target = Target::Remote {
+                    machine: machine.clone(),
+                    target: Box::new(target),
+                };
+            }
             let result = client
-                .confirm(
-                    &Target::Directory {
-                        path: destination.clone(),
-                    },
-                    &workspaces,
-                )
+                .confirm(&target, &workspaces)
                 .map_err(|error| error.to_string());
             if result.is_ok() {
-                let _ = SystemRunner.run(
-                    OsStr::new("zoxide"),
-                    &["add".into(), "--".into(), destination.into_os_string()],
-                    READ_TIMEOUT,
-                );
+                if let Some(machine) = &machine {
+                    let _ = crate::machine::Remote::discover(&SystemRunner, machine).and_then(
+                        |remote| {
+                            remote.call::<()>(crate::machine::Operation::ZoxideAdd(destination))
+                        },
+                    );
+                } else {
+                    let _ = SystemRunner.run(
+                        &crate::machine::installed_program("zoxide"),
+                        &["add".into(), "--".into(), destination.into_os_string()],
+                        READ_TIMEOUT,
+                    );
+                }
             }
             Reply::Open(result)
         }));
@@ -697,12 +975,13 @@ impl Flow {
 
     fn submit(&mut self) {
         self.error = None;
+        let backend = self.backend.clone();
         match self.step {
             Step::Name => {
                 let root = self.repo.as_ref().unwrap().root.clone();
                 let name = self.name.text.clone();
                 self.job = Some(spawn(move || {
-                    Reply::Name(validate_name(&SystemRunner, &root, &name))
+                    Reply::Name(backend.run(Operation::Name { root, name }))
                 }));
             }
             Step::Base => {
@@ -711,40 +990,41 @@ impl Flow {
                     let root = repo.root.clone();
                     let reference = repo.branches[base].reference.clone();
                     self.job = Some(spawn(move || {
-                        Reply::Base(resolve(&SystemRunner, &root, &reference))
+                        Reply::Base(backend.run(Operation::Resolve { root, reference }))
                     }));
                 } else {
                     self.error =
                         Some("Choose a base branch with ↑/↓ (required for detached HEAD).".into());
                 }
             }
-            Step::Destination => match expand_path(&self.destination.text, self.parent()) {
-                Ok(destination) => {
-                    let mut plan = Plan {
-                        repo: self.repo.as_ref().unwrap().root.clone(),
-                        name: self.name.text.clone(),
-                        commit: self.commit.clone(),
-                        destination,
-                    };
-                    self.job = Some(spawn(move || {
-                        Reply::Destination((|| {
-                            plan.destination = absolute_destination(&plan.destination)?;
-                            validate_destination(&plan)?;
-                            Ok(plan)
-                        })())
-                    }));
-                }
-                Err(error) => self.error = Some(error),
-            },
+            Step::Destination => {
+                let plan = Plan {
+                    repo: self.repo.as_ref().unwrap().root.clone(),
+                    name: self.name.text.clone(),
+                    commit: self.commit.clone(),
+                    destination: PathBuf::new(),
+                };
+                let value = self.destination.text.clone();
+                let parent = self.parent().to_path_buf();
+                self.job = Some(spawn(move || {
+                    Reply::Destination(backend.run(Operation::Destination {
+                        plan,
+                        value,
+                        parent,
+                    }))
+                }));
+            }
             Step::Review => {
                 let plan = self.plan.clone().unwrap();
                 self.step = Step::Creating;
-                self.job = Some(spawn(move || Reply::Create(create(&SystemRunner, &plan))));
+                self.job = Some(spawn(move || {
+                    Reply::Create(backend.run(Operation::Create(plan)).unwrap_or_else(|error| Creation::Uncertain(format!("{error}. Creation may have completed; recheck before retrying."))))
+                }));
             }
             Step::Reconcile => {
                 let plan = self.plan.clone().unwrap();
                 self.job = Some(spawn(move || {
-                    Reply::Reconcile(reconcile(&SystemRunner, &plan))
+                    Reply::Reconcile(backend.run(Operation::Reconcile(plan)))
                 }));
             }
             Step::OpenFailed => {
@@ -787,7 +1067,10 @@ impl Flow {
             width,
             height,
         );
-        let block = Block::bordered().title(" Create Worktree ");
+        let host = self
+            .machine()
+            .map_or_else(crate::machine::local_label, |machine| machine.label.clone());
+        let block = Block::bordered().title(format!(" Create Worktree · {host} "));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let [context, name, base, destination, list, status, button, footer] = Layout::vertical([
@@ -1141,6 +1424,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_worktree_operations_and_completion_keep_paths_opaque() {
+        use crate::machine::testing::{machine, payload, RemoteRunner};
+        let host = machine();
+        let backend = Backend {
+            machine: Some(host),
+            ..Default::default()
+        };
+        let runner = RemoteRunner {
+            helper_reply: serde_json::json!(["/remote/home/dev/project/"]),
+            ..Default::default()
+        };
+        let results: Vec<String> = backend
+            .run_with(
+                &runner,
+                Operation::Complete {
+                    text: "~/pr".into(),
+                    parent: "/remote/repo".into(),
+                    zoxide: vec!["/remote/zoxide".into()],
+                },
+            )
+            .unwrap();
+        assert_eq!(results, vec!["/remote/home/dev/project/"]);
+        let calls = runner.calls.lock().unwrap();
+        let request = payload(&calls.last().unwrap().1);
+        assert_eq!(request["operation"]["Worktree"]["Complete"]["text"], "~/pr");
+        assert_eq!(
+            request["operation"]["Worktree"]["Complete"]["parent"],
+            "/remote/repo"
+        );
+        drop(calls);
+        let plan = Plan {
+            repo: "/remote/repo".into(),
+            name: "feature".into(),
+            commit: "abc".into(),
+            destination: "/remote/home/dev/new".into(),
+        };
+        let runner = RemoteRunner {
+            helper_reply: serde_json::to_value(&plan).unwrap(),
+            ..Default::default()
+        };
+        let result: Plan = backend
+            .run_with(
+                &runner,
+                Operation::Destination {
+                    plan: plan.clone(),
+                    value: "~/new".into(),
+                    parent: "/remote/repo".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(result.destination, plan.destination);
+        let calls = runner.calls.lock().unwrap();
+        let request = payload(&calls.last().unwrap().1);
+        assert_eq!(
+            request["operation"]["Worktree"]["Destination"]["value"],
+            "~/new"
+        );
+        assert!(!calls.iter().any(|(program, _)| program == "git"));
+    }
+
+    #[test]
     fn ctrl_w_deletes_previous_word_and_whitespace_without_touching_suffix() {
         for (text, cursor, expected, position) in [
             ("one two  ", 9, "one ", 4),
@@ -1396,6 +1740,43 @@ mod tests {
     }
 
     #[test]
+    fn remote_worktree_ack_closes_picker_but_legacy_requires_sidebar() {
+        let (_temp, root) = repository();
+        for switched_client in [false, true] {
+            let mut flow = Flow::new(root.clone(), Vec::new(), CompletionGate::default());
+            settle(&mut flow);
+            flow.backend.machine = Some(crate::machine::testing::machine());
+            flow.plan = Some(plan(&root));
+            flow.step = Step::Opening;
+            flow.opened = Some(ConfirmResult {
+                resolved_workspace_id: Some("created-w1".into()),
+                switched_client,
+            });
+            let mut flow = Some(flow);
+            let mut app = crate::model::App::new(crate::model::Tab::Zoxide);
+            let mut needs_draw = false;
+            let mut history_dirty = false;
+            let client = Client::with_client_token(SystemRunner, "must-not-run".into(), None);
+            assert_eq!(
+                crate::poll_worktree(
+                    &mut app,
+                    &mut flow,
+                    &client,
+                    &mut needs_draw,
+                    &mut history_dirty
+                ),
+                switched_client
+            );
+            assert!(flow.is_none());
+            assert!(history_dirty);
+            assert_eq!(app.warning.is_none(), switched_client);
+            if !switched_client {
+                assert!(app.warning.as_ref().unwrap().contains("sidebar"));
+            }
+        }
+    }
+
+    #[test]
     fn existing_destination_is_never_overwritten() {
         let (_temp, root) = repository();
         let plan = plan(&root);
@@ -1506,6 +1887,38 @@ mod tests {
         assert!(flow.completion_job.is_none());
         flow.key(key(KeyCode::Backspace));
         assert_eq!(flow.completions.len(), 2);
+    }
+
+    #[test]
+    fn remote_directory_cache_filters_latest_input_without_local_home_expansion() {
+        let (_temp, root) = repository();
+        let mut flow = Flow::new(root, Vec::new(), CompletionGate::default());
+        settle(&mut flow);
+        flow.backend.machine = Some(crate::machine::testing::machine());
+        flow.step = Step::Destination;
+        flow.destination.set("~/ap".into());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        flow.remote_completion = Some(receiver);
+        flow.key(key(KeyCode::Char('p')));
+        sender
+            .send((
+                "~/ap".into(),
+                Ok(CompletionValues::Directory(vec![
+                    "/remote/home/apple".into(),
+                    "/remote/home/apricot".into(),
+                ])),
+            ))
+            .ok()
+            .unwrap();
+        flow.poll();
+        assert_eq!(flow.completions, vec!["/remote/home/apple/"]);
+        assert!(flow.remote_completion.is_none());
+        assert_eq!(flow.directory_cache[0].directory, PathBuf::from("~/"));
+        flow.key(key(KeyCode::Backspace));
+        assert_eq!(flow.completions.len(), 2);
+        flow.poll();
+        assert!(flow.remote_completion.is_none());
+        assert!(flow.completion_job.is_none());
     }
 
     #[test]

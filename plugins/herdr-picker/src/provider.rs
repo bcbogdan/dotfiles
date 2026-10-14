@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io::{Read, Seek, SeekFrom};
@@ -5,6 +6,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -15,6 +17,7 @@ use crate::model::{canonicalish, Item, Target};
 use crate::profile;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
+const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(40);
 const OUTPUT_LIMIT: usize = 512 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +35,8 @@ pub enum Error {
     Parse(&'static str, serde_json::Error),
     #[error("invalid {0} response: {1}")]
     Structure(&'static str, String),
+    #[error("client navigation timed out; outcome unknown (the request was not cancelled). Check Herdr before retrying")]
+    NavigationTimeout,
 }
 
 pub trait Runner: Send + Sync {
@@ -142,9 +147,8 @@ impl Runner for SystemRunner {
                 message,
             });
         }
-        let output = String::from_utf8_lossy(&stdout).into_owned();
         drop(command_span);
-        Ok(output)
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 }
 
@@ -175,16 +179,39 @@ fn read_tail(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
 pub struct Client<R> {
     runner: R,
     herdr: OsString,
+    prefix: Vec<OsString>,
+    navigation_enabled: bool,
+    pending_workspaces: Arc<Mutex<HashMap<(String, PathBuf), String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmResult {
     pub resolved_workspace_id: Option<String>,
+    pub switched_client: bool,
 }
 
 impl<R: Runner> Client<R> {
     pub fn new(runner: R, herdr: OsString) -> Self {
-        Self { runner, herdr }
+        Self::with_client_token(
+            runner,
+            herdr,
+            std::env::var_os("HERDR_CLIENT_TOKEN").as_deref(),
+        )
+    }
+
+    pub fn with_client_token(runner: R, herdr: OsString, token: Option<&OsStr>) -> Self {
+        Self {
+            runner,
+            herdr,
+            prefix: Vec::new(),
+            navigation_enabled: token.is_some_and(|token| !token.is_empty()),
+            pending_workspaces: Arc::default(),
+        }
+    }
+
+    pub fn with_session(mut self, session: String) -> Self {
+        self.prefix = vec!["--session".into(), session.into()];
+        self
     }
 
     pub fn load(&self, self_pane: Option<&str>) -> [Result<Vec<Item>, String>; 3] {
@@ -214,7 +241,7 @@ impl<R: Runner> Client<R> {
             })
             .map_err(|error| error.to_string());
         let zoxide_source = match self.runner.run(
-            OsStr::new("zoxide"),
+            &crate::machine::installed_program("zoxide"),
             &args(&["query", "-l", "-s"]),
             COMMAND_TIMEOUT,
         ) {
@@ -237,15 +264,67 @@ impl<R: Runner> Client<R> {
 
     pub fn confirm(&self, target: &Target, workspaces: &[Item]) -> Result<ConfirmResult, Error> {
         match target {
+            Target::Remote { machine, target } => {
+                if self.navigation_enabled {
+                    return self.navigate_remote(machine, target, workspaces);
+                }
+                let run = |args: &[OsString]| {
+                    crate::machine::forwarded(&self.runner, machine, args)
+                        .map_err(|message| Error::Structure("remote action", message))
+                };
+                match target.as_ref() {
+                    Target::Workspace { id } => {
+                        run(&args(&["workspace", "focus", id]))?;
+                        Ok(ConfirmResult {
+                            switched_client: false,
+                            resolved_workspace_id: None,
+                        })
+                    }
+                    Target::Agent { pane_id } => {
+                        run(&args(&["agent", "focus", pane_id]))?;
+                        Ok(ConfirmResult {
+                            switched_client: false,
+                            resolved_workspace_id: None,
+                        })
+                    }
+                    Target::Directory { path } => {
+                        let existing = remote_workspace_for_path(machine, path, workspaces);
+                        let id = if let Some(id) = existing {
+                            run(&args(&["workspace", "focus", &id]))?;
+                            id
+                        } else {
+                            parse_created_workspace_id(&run(&[
+                                "workspace".into(),
+                                "create".into(),
+                                "--cwd".into(),
+                                path.as_os_str().to_owned(),
+                                "--label".into(),
+                                sensible_label(path).into(),
+                                "--focus".into(),
+                            ])?)?
+                        };
+                        Ok(ConfirmResult {
+                            switched_client: false,
+                            resolved_workspace_id: Some(id),
+                        })
+                    }
+                    Target::Remote { .. } => Err(Error::Structure(
+                        "remote action",
+                        "nested remote target".into(),
+                    )),
+                }
+            }
             Target::Workspace { id } => {
                 self.herdr(&["workspace", "focus", id])?;
                 Ok(ConfirmResult {
+                    switched_client: false,
                     resolved_workspace_id: None,
                 })
             }
             Target::Agent { pane_id } => {
                 self.herdr(&["agent", "focus", pane_id])?;
                 Ok(ConfirmResult {
+                    switched_client: false,
                     resolved_workspace_id: None,
                 })
             }
@@ -253,6 +332,7 @@ impl<R: Runner> Client<R> {
                 if let Some(id) = workspace_for_path(path, workspaces) {
                     self.herdr(&["workspace", "focus", id])?;
                     return Ok(ConfirmResult {
+                        switched_client: false,
                         resolved_workspace_id: Some(id.to_string()),
                     });
                 }
@@ -268,10 +348,95 @@ impl<R: Runner> Client<R> {
                 ])?;
                 let workspace_id = parse_created_workspace_id(&raw)?;
                 Ok(ConfirmResult {
+                    switched_client: false,
                     resolved_workspace_id: Some(workspace_id),
                 })
             }
         }
+    }
+
+    pub fn has_pending_workspace(&self, machine: &crate::machine::Machine, path: &Path) -> bool {
+        self.pending_workspaces
+            .lock()
+            .unwrap()
+            .contains_key(&(machine.namespace(), path.to_owned()))
+    }
+
+    fn navigate_remote(
+        &self,
+        machine: &crate::machine::Machine,
+        target: &Target,
+        workspaces: &[Item],
+    ) -> Result<ConfirmResult, Error> {
+        crate::machine::validate_profile(&self.runner, machine)
+            .map_err(|message| Error::Structure("remote action", message))?;
+        if !machine.enabled {
+            return Err(Error::Structure(
+                "remote action",
+                "machine is disabled".into(),
+            ));
+        }
+        let mut pending_key = None;
+        let (flag, id, directory) = match target {
+            Target::Workspace { id } => ("--workspace", id.clone(), false),
+            Target::Agent { pane_id } => ("--pane", pane_id.clone(), false),
+            Target::Directory { path } => {
+                let key = (machine.namespace(), path.clone());
+                let pending = self.pending_workspaces.lock().unwrap().get(&key).cloned();
+                let existing =
+                    pending.or_else(|| remote_workspace_for_path(machine, path, workspaces));
+                let id = if let Some(id) = existing {
+                    id
+                } else {
+                    let raw = crate::machine::forwarded(
+                        &self.runner,
+                        machine,
+                        &[
+                            "workspace".into(),
+                            "create".into(),
+                            "--cwd".into(),
+                            path.as_os_str().to_owned(),
+                            "--label".into(),
+                            sensible_label(path).into(),
+                        ],
+                    )
+                    .map_err(|message| Error::Structure("remote action", message))?;
+                    parse_created_workspace_id(&raw)?
+                };
+                // Cloned async clients share this ID so a failed switch cannot duplicate creation.
+                self.pending_workspaces
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), id.clone());
+                pending_key = Some(key);
+                ("--workspace", id, true)
+            }
+            Target::Remote { .. } => {
+                return Err(Error::Structure(
+                    "remote action",
+                    "nested remote target".into(),
+                ))
+            }
+        };
+        // The token and socket are inherited. Navigation belongs to the originating server,
+        // not the destination's --machine forwarding connection or session.
+        self.runner
+            .run(
+                &self.herdr,
+                &args(&["client", "navigate", &machine.id, flag, &id]),
+                NAVIGATION_TIMEOUT,
+            )
+            .map_err(|error| match error {
+                Error::Timeout { .. } => Error::NavigationTimeout,
+                error => error,
+            })?;
+        if let Some(key) = pending_key {
+            self.pending_workspaces.lock().unwrap().remove(&key);
+        }
+        Ok(ConfirmResult {
+            resolved_workspace_id: directory.then_some(id),
+            switched_client: true,
+        })
     }
 
     fn herdr(&self, values: &[&str]) -> Result<String, Error> {
@@ -279,7 +444,9 @@ impl<R: Runner> Client<R> {
     }
 
     fn herdr_os(&self, values: &[OsString]) -> Result<String, Error> {
-        self.runner.run(&self.herdr, values, COMMAND_TIMEOUT)
+        let mut args = self.prefix.clone();
+        args.extend_from_slice(values);
+        self.runner.run(&self.herdr, &args, COMMAND_TIMEOUT)
     }
 }
 
@@ -509,9 +676,31 @@ pub fn parse_zoxide(raw: &str) -> Vec<Item> {
         .collect()
 }
 
+fn remote_workspace_for_path(
+    machine: &crate::machine::Machine,
+    path: &Path,
+    workspaces: &[Item],
+) -> Option<String> {
+    workspaces.iter().find_map(|item| {
+        if item
+            .machine()
+            .is_some_and(|host| host.namespace() == machine.namespace())
+            && item.match_paths.iter().any(|candidate| candidate == path)
+        {
+            if let Target::Workspace { id } = item.target.inner() {
+                return Some(id.clone());
+            }
+        }
+        None
+    })
+}
+
 pub fn workspace_for_path<'a>(path: &Path, workspaces: &'a [Item]) -> Option<&'a str> {
     let path = canonicalish(path);
     workspaces.iter().find_map(|item| {
+        if item.machine().is_some() {
+            return None;
+        }
         item.match_paths
             .iter()
             .any(|candidate| candidate == &path)
@@ -570,6 +759,284 @@ pub fn directory_summary<R: Runner>(runner: &R, path: &Path) -> Result<String, E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machine::testing::{item, machine, RemoteRunner};
+
+    #[derive(Clone, Default)]
+    struct NavigationRunner {
+        remote: RemoteRunner,
+        failure: Arc<Mutex<Option<&'static str>>>,
+    }
+
+    impl Runner for NavigationRunner {
+        fn run(
+            &self,
+            program: &OsStr,
+            values: &[OsString],
+            timeout: Duration,
+        ) -> Result<String, Error> {
+            if program == "origin-herdr" {
+                self.remote
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .push((program.into(), values.to_vec()));
+                if values.first().is_some_and(|arg| arg == "client") {
+                    assert!(timeout > Duration::from_secs(30));
+                    if let Some(message) = *self.failure.lock().unwrap() {
+                        if message == "timeout" {
+                            return Err(Error::Timeout {
+                                program: "origin-herdr".into(),
+                            });
+                        }
+                        return Err(Error::Command {
+                            program: "origin-herdr".into(),
+                            message: message.into(),
+                        });
+                    }
+                }
+                return Ok("{}".into());
+            }
+            self.remote.run(program, values, timeout)
+        }
+    }
+
+    #[test]
+    fn token_routes_workspace_and_pane_via_origin_without_forwarding_or_session() {
+        let runner = NavigationRunner::default();
+        let client = Client::with_client_token(
+            runner.clone(),
+            "origin-herdr".into(),
+            Some(OsStr::new("inherited-token")),
+        )
+        .with_session("origin-session".into());
+        for (target, flag, id) in [
+            (Target::Workspace { id: "w1".into() }, "--workspace", "w1"),
+            (
+                Target::Agent {
+                    pane_id: "p1".into(),
+                },
+                "--pane",
+                "p1",
+            ),
+        ] {
+            let result = client
+                .confirm(&item(target).on_machine(&machine()).target, &[])
+                .unwrap();
+            assert!(result.switched_client);
+            let calls = runner.remote.calls.lock().unwrap();
+            assert_eq!(
+                calls.last().unwrap(),
+                &(
+                    "origin-herdr".into(),
+                    args(&["client", "navigate", "opaque-profile-id", flag, id])
+                )
+            );
+            assert!(calls
+                .iter()
+                .all(|(_, args)| !args.iter().any(|arg| arg == "--machine")));
+        }
+    }
+
+    #[test]
+    fn navigation_errors_never_fall_back_and_manual_retry_reuses_created_workspace() {
+        let runner = NavigationRunner::default();
+        let client = Client::with_client_token(
+            runner.clone(),
+            "origin-herdr".into(),
+            Some(OsStr::new("token")),
+        );
+        let target = item(Target::Directory {
+            path: "/same/path".into(),
+        })
+        .on_machine(&machine())
+        .target;
+        for failure in ["navigation unsupported", "timeout"] {
+            *runner.failure.lock().unwrap() = Some(failure);
+            let error = client
+                .clone()
+                .confirm(&target, &[])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(if failure == "timeout" {
+                "outcome unknown"
+            } else {
+                failure
+            }));
+            assert!(client.has_pending_workspace(&machine(), Path::new("/same/path")));
+        }
+        *runner.failure.lock().unwrap() = None;
+        let result = client.clone().confirm(&target, &[]).unwrap();
+        assert!(result.switched_client);
+        assert_eq!(result.resolved_workspace_id.as_deref(), Some("w9"));
+        let calls = runner.remote.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, args)| args.iter().any(|arg| arg == "create"))
+                .count(),
+            1
+        );
+        assert!(calls
+            .iter()
+            .all(|(_, args)| !args.iter().any(|arg| arg == "--focus" || arg == "focus")));
+        assert_eq!(
+            calls.last().unwrap().1,
+            args(&[
+                "client",
+                "navigate",
+                "opaque-profile-id",
+                "--workspace",
+                "w9"
+            ])
+        );
+    }
+
+    #[test]
+    fn matching_remote_directory_navigates_and_local_focus_stays_on_executing_server() {
+        let runner = NavigationRunner::default();
+        let client = Client::with_client_token(
+            runner.clone(),
+            "origin-herdr".into(),
+            Some(OsStr::new("token")),
+        );
+        let workspace = item(Target::Workspace {
+            id: "existing".into(),
+        })
+        .on_machine(&machine());
+        let target = item(Target::Directory {
+            path: "/same/path".into(),
+        })
+        .on_machine(&machine())
+        .target;
+        let result = client.confirm(&target, &[workspace]).unwrap();
+        assert_eq!(result.resolved_workspace_id.as_deref(), Some("existing"));
+        assert!(result.switched_client);
+        assert!(
+            !client
+                .confirm(
+                    &Target::Workspace {
+                        id: "local-w1".into()
+                    },
+                    &[]
+                )
+                .unwrap()
+                .switched_client
+        );
+        let calls = runner.remote.calls.lock().unwrap();
+        assert_eq!(
+            calls.last().unwrap().1,
+            args(&["workspace", "focus", "local-w1"])
+        );
+        assert!(calls
+            .iter()
+            .all(|(_, args)| !args.iter().any(|arg| arg == "--machine" || arg == "create")));
+    }
+
+    #[test]
+    fn absent_or_empty_token_retains_legacy_remote_focus() {
+        for token in [None, Some(OsStr::new(""))] {
+            let runner = RemoteRunner::default();
+            let client = Client::with_client_token(runner.clone(), "must-not-run".into(), token);
+            let result = client
+                .confirm(
+                    &item(Target::Workspace { id: "w1".into() })
+                        .on_machine(&machine())
+                        .target,
+                    &[],
+                )
+                .unwrap();
+            assert!(!result.switched_client);
+            assert_eq!(
+                runner.calls.lock().unwrap().last().unwrap().1,
+                args(&["--machine", "opaque-profile-id", "workspace", "focus", "w1"])
+            );
+        }
+    }
+
+    #[test]
+    fn remote_actions_are_profile_qualified_and_never_fall_back_locally() {
+        let runner = RemoteRunner {
+            fail_forward: true,
+            ..Default::default()
+        };
+        let client =
+            Client::with_client_token(runner.clone(), "local-compatible-backup".into(), None);
+        for target in [
+            Target::Workspace { id: "w1".into() },
+            Target::Agent {
+                pane_id: "p1".into(),
+            },
+            Target::Directory {
+                path: "/same/path".into(),
+            },
+        ] {
+            assert!(client
+                .confirm(&item(target).on_machine(&machine()).target, &[])
+                .is_err());
+        }
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, args)| args[0] == "--machine")
+                .count(),
+            3
+        );
+        assert!(calls
+            .iter()
+            .all(|(program, _)| program != "local-compatible-backup"));
+    }
+
+    #[test]
+    fn directory_resolution_is_scoped_to_machine_and_disabled_profile_cannot_act() {
+        let runner = RemoteRunner::default();
+        let client =
+            Client::with_client_token(runner.clone(), "local-compatible-backup".into(), None);
+        let local = item(Target::Workspace {
+            id: "local-w1".into(),
+        });
+        let remote = item(Target::Workspace {
+            id: "remote-w1".into(),
+        })
+        .on_machine(&machine());
+        let target = item(Target::Directory {
+            path: "/same/path".into(),
+        })
+        .on_machine(&machine())
+        .target;
+        assert_eq!(
+            client
+                .confirm(&target, &[local.clone(), remote.clone()])
+                .unwrap()
+                .resolved_workspace_id
+                .as_deref(),
+            Some("remote-w1")
+        );
+        assert_eq!(
+            workspace_for_path(Path::new("/same/path"), &[remote, local]),
+            Some("same-id")
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(
+            calls.last().unwrap().1,
+            args(&[
+                "--machine",
+                "opaque-profile-id",
+                "workspace",
+                "focus",
+                "remote-w1"
+            ])
+        );
+        drop(calls);
+        let disabled = RemoteRunner {
+            disabled: true,
+            ..Default::default()
+        };
+        assert!(Client::new(disabled.clone(), "local".into())
+            .confirm(&target, &[])
+            .is_err());
+        assert_eq!(disabled.calls.lock().unwrap().len(), 1);
+    }
     use std::sync::Mutex;
 
     struct FakeRunner {
@@ -584,7 +1051,7 @@ mod tests {
             args: &[OsString],
             _timeout: Duration,
         ) -> Result<String, Error> {
-            if program == OsStr::new("zoxide") {
+            if Path::new(program).file_name() == Some(OsStr::new("zoxide")) {
                 return Err(Error::Spawn {
                     program: "zoxide".into(),
                     source: std::io::Error::from(std::io::ErrorKind::NotFound),

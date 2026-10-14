@@ -102,6 +102,10 @@ impl Reducer {
                     app.cycle_sort();
                     Effect::SelectionChanged
                 }
+                'm' | 'g' => {
+                    app.cycle_machine();
+                    Effect::SelectionChanged
+                }
                 _ => Effect::None,
             };
         }
@@ -113,7 +117,7 @@ impl Reducer {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 if app.tab == Tab::Zoxide
                     && app.selected().is_some_and(|item| {
-                        matches!(item.target, crate::model::Target::Directory { .. })
+                        matches!(item.target.inner(), crate::model::Target::Directory { .. })
                     })
                 {
                     Effect::CreateWorktree

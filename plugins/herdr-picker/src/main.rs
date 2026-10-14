@@ -1,5 +1,7 @@
 mod history;
 mod input;
+mod listing_cache;
+mod machine;
 mod model;
 mod preview;
 mod profile;
@@ -59,6 +61,22 @@ impl Drop for KeyboardEnhancements {
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--helper-v1")
+    {
+        return match arguments
+            .get(1)
+            .ok_or_else(|| "missing helper payload".to_string())
+            .and_then(|payload| machine::helper(payload))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("herdr-picker helper: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let preview_mode = match parse_preview_mode(&arguments) {
         Ok(mode) => mode,
         Err(error) => {
@@ -224,6 +242,59 @@ fn event_loop(
     result
 }
 
+type ActionReply = (model::Item, Result<provider::ConfirmResult, String>);
+
+#[derive(Default)]
+struct RemoteAction(Option<std::sync::mpsc::Receiver<ActionReply>>);
+
+impl RemoteAction {
+    fn poll(&mut self, app: &mut App, history_dirty: &mut bool) -> (bool, bool) {
+        let Some((item, result)) = self.0.as_ref().and_then(|job| job.try_recv().ok()) else {
+            return (false, false);
+        };
+        self.0 = None;
+        match result {
+            Ok(result) => {
+                let switched_client = result.switched_client;
+                record_confirm(app, &item, result, history::unix_time());
+                *history_dirty = true;
+                if switched_client {
+                    app.warning = None;
+                    return (true, true);
+                }
+                app.warning = Some(remote_success(&item.machine_label()));
+            }
+            Err(error) => app.warning = Some(format!("{}: {error}", item.machine_label())),
+        }
+        (true, false)
+    }
+
+    fn confirm(&mut self, app: &mut App, client: &Client<SystemRunner>) -> Option<model::Item> {
+        if self.0.is_some() {
+            return None;
+        }
+        let item = app.selected()?.clone();
+        if !app.actionable(&item) {
+            return None;
+        }
+        if item.machine().is_none() {
+            return Some(item);
+        }
+        app.warning = Some(format!("Opening on {}…", item.machine_label()));
+        let client = client.clone();
+        let workspaces = app.workspace_identity().to_vec();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = client
+                .confirm(&item.target, &workspaces)
+                .map_err(|error| error.to_string());
+            let _ = sender.send((item, result));
+        });
+        self.0 = Some(receiver);
+        None
+    }
+}
+
 fn event_loop_inner(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -239,21 +310,21 @@ fn event_loop_inner(
     let mut refreshed_at = Instant::now();
     request_refresh(app, runtime, &mut refresh_scheduler, self_pane.clone());
     let size = terminal.size()?;
-    let mut dimensions = ui::preview_dimensions(
-        Rect::new(0, 0, size.width, size.height),
-        app.preview_mode.enabled(),
-    );
+    let mut dimensions = preview_dimensions(app, size.width, size.height);
     let mut input_started = None;
     let mut needs_draw = true;
     let mut flow: Option<worktree::Flow> = None;
-    let completion_gate = worktree::CompletionGate::default();
+    let mut completion_gates = std::collections::HashMap::new();
+    let mut remote_action = RemoteAction::default();
 
     Ok(loop {
-        if poll_worktree(app, flow.as_mut(), client, &mut needs_draw) {
+        let (changed, done) = remote_action.poll(app, history_dirty);
+        needs_draw |= changed;
+        if done || poll_worktree(app, &mut flow, client, &mut needs_draw, history_dirty) {
             *history_dirty = true;
             break None;
         }
-        let previous = app.selected().map(model::Item::preview_identity);
+        let previous = selected_preview(app);
         let (messages_changed_history, messages_need_draw) = process_runtime_messages(
             app,
             runtime,
@@ -263,8 +334,9 @@ fn event_loop_inner(
         );
         *history_dirty |= messages_changed_history;
         needs_draw |= messages_need_draw;
-        let current = app.selected().map(model::Item::preview_identity);
-        if flow.is_none() && app.preview_mode.enabled() && current != previous {
+        let resized = update_preview_geometry(terminal, app, &mut dimensions)?;
+        let current = selected_preview(app);
+        if flow.is_none() && app.preview_mode.enabled() && (current != previous || resized) {
             request_preview(app, runtime, &mut live, &mut arbiter, dimensions);
             needs_draw = true;
         }
@@ -279,10 +351,7 @@ fn event_loop_inner(
         if event::poll(poll_interval(flow.as_ref(), &live))? {
             match event::read()? {
                 Event::Resize(width, height) => {
-                    dimensions = ui::preview_dimensions(
-                        Rect::new(0, 0, width, height),
-                        app.preview_mode.enabled(),
-                    );
+                    dimensions = preview_dimensions(app, width, height);
                     if flow.is_none() && app.preview_mode.enabled() {
                         request_preview(app, runtime, &mut live, &mut arbiter, dimensions);
                     }
@@ -302,10 +371,12 @@ fn event_loop_inner(
                     needs_draw = true;
                     match reducer.key(app, key, Instant::now()) {
                         Effect::Confirm => {
-                            break app.selected().cloned();
+                            if let Some(item) = remote_action.confirm(app, client) {
+                                break Some(item);
+                            }
                         }
                         Effect::CreateWorktree => {
-                            flow = start_worktree(app, &completion_gate);
+                            flow = start_worktree(app, &mut completion_gates);
                             if flow.is_some() {
                                 live.select(None, dimensions);
                             }
@@ -345,6 +416,30 @@ fn process_runtime_messages(
     let mut needs_draw = false;
     while let Some(message) = runtime.try_recv() {
         match message {
+            Message::Catalog(result) => {
+                runtime::apply_catalog(app, result);
+                needs_draw = true;
+            }
+            Message::HostStarted { namespace, epoch } => {
+                app.host_epochs.insert(namespace, epoch);
+            }
+            Message::HostRefresh {
+                machine,
+                epoch,
+                result,
+            } => {
+                runtime::apply_host(app, &machine, epoch, result);
+                history_dirty |= app.observe_visible(history::unix_time());
+                needs_draw = true;
+            }
+            Message::HostCached {
+                machine,
+                epoch,
+                result,
+            } => {
+                runtime::apply_cached(app, &machine, epoch, result);
+                needs_draw = true;
+            }
             Message::Refresh { generation, result } => {
                 let apply = profile::span(
                     "refresh.apply",
@@ -369,6 +464,30 @@ fn process_runtime_messages(
     (history_dirty, needs_draw)
 }
 
+fn preview_dimensions(app: &App, width: u16, height: u16) -> (u16, u16) {
+    ui::preview_dimensions(
+        Rect::new(0, 0, width, height.saturating_sub(ui::status_height(app))),
+        app.preview_mode.enabled(),
+    )
+}
+
+fn selected_preview(app: &App) -> (Option<model::PreviewIdentity>, u64) {
+    (
+        app.selected().map(model::Item::preview_identity),
+        app.host_preview_revision,
+    )
+}
+
+fn update_preview_geometry(
+    terminal: &ratatui::DefaultTerminal,
+    app: &App,
+    dimensions: &mut (u16, u16),
+) -> std::io::Result<bool> {
+    let size = terminal.size()?;
+    let next = preview_dimensions(app, size.width, size.height);
+    Ok(std::mem::replace(dimensions, next) != next)
+}
+
 fn input_span(key: event::KeyEvent) -> profile::Span {
     profile::span("input.handle", || {
         serde_json::json!({
@@ -388,32 +507,50 @@ fn worktree_key(flow: &mut Option<worktree::Flow>, key: event::KeyEvent) -> bool
     true
 }
 
-fn start_worktree(app: &App, completion_gate: &worktree::CompletionGate) -> Option<worktree::Flow> {
-    let model::Target::Directory { path } = &app.selected()?.target else {
+fn start_worktree(
+    app: &App,
+    completion_gates: &mut std::collections::HashMap<String, worktree::CompletionGate>,
+) -> Option<worktree::Flow> {
+    let selected = app.selected()?;
+    if !app.actionable(selected) {
+        return None;
+    }
+    let machine = selected.machine().cloned();
+    let namespace = machine
+        .as_ref()
+        .map_or_else(|| "local".into(), machine::Machine::namespace);
+    let completion_gate = completion_gates.entry(namespace).or_default();
+    let model::Target::Directory { path } = selected.target.inner() else {
         return None;
     };
     let cached = match &app.tabs[Tab::Zoxide.index()].source {
         LoadState::Ready(items) => items
             .iter()
-            .filter_map(|item| match &item.target {
+            .filter(|item| {
+                item.machine().map(machine::Machine::namespace)
+                    == machine.as_ref().map(machine::Machine::namespace)
+            })
+            .filter_map(|item| match item.target.inner() {
                 model::Target::Directory { path } => Some(path.clone()),
                 _ => None,
             })
             .collect(),
         _ => Vec::new(),
     };
-    Some(worktree::Flow::new(
+    Some(worktree::Flow::on_host(
         path.clone(),
         cached,
         completion_gate.clone(),
+        machine,
     ))
 }
 
 fn poll_worktree(
     app: &mut App,
-    flow: Option<&mut worktree::Flow>,
+    flow: &mut Option<worktree::Flow>,
     client: &Client<SystemRunner>,
     needs_draw: &mut bool,
+    history_dirty: &mut bool,
 ) -> bool {
     let Some(active) = flow else {
         return false;
@@ -424,6 +561,27 @@ fn poll_worktree(
         return false;
     };
     let now = history::unix_time();
+    if let Some(machine) = active.machine().cloned() {
+        let switched_client = result.switched_client;
+        let target = model::Target::Remote {
+            machine: machine.clone(),
+            target: Box::new(model::Target::Directory { path }),
+        };
+        app.record_access(&target.history_key(), now);
+        if let Some(id) = result.resolved_workspace_id {
+            let key = model::HistoryKey::Remote {
+                namespace: machine.namespace(),
+                key: Box::new(model::HistoryKey::workspace(id)),
+            };
+            app.record_access(&key, now);
+        }
+        app.warning = (!switched_client)
+            .then(|| format!("Worktree created. {}", remote_success(&machine.label)));
+        *history_dirty = true;
+        *needs_draw = true;
+        *flow = None;
+        return switched_client;
+    }
     app.record_access(&model::HistoryKey::directory(&path), now);
     if let Some(id) = result.resolved_workspace_id {
         app.record_access(&model::HistoryKey::workspace(id), now);
@@ -497,12 +655,28 @@ fn confirm_item<R: Runner, S: history::Store>(
     now: u64,
 ) -> Result<(), provider::Error> {
     let result = client.confirm(&item.target, app.workspace_identity())?;
-    app.record_access(&item.history_key(), now);
-    if let Some(workspace_id) = result.resolved_workspace_id {
-        app.record_access(&model::HistoryKey::workspace(workspace_id), now);
-    }
+    record_confirm(app, item, result, now);
     persist_history(store, app, now);
     Ok(())
+}
+
+fn remote_success(label: &str) -> String {
+    format!("Opened on {label}. Select {label} in Herdr's machine sidebar to view it.")
+}
+
+fn record_confirm(app: &mut App, item: &model::Item, result: provider::ConfirmResult, now: u64) {
+    app.record_access(&item.history_key(), now);
+    if let Some(workspace_id) = result.resolved_workspace_id {
+        let key = model::HistoryKey::workspace(workspace_id);
+        let key = item.machine().map_or_else(
+            || key.clone(),
+            |machine| model::HistoryKey::Remote {
+                namespace: machine.namespace(),
+                key: Box::new(key.clone()),
+            },
+        );
+        app.record_access(&key, now);
+    }
 }
 
 fn persist_history(store: &impl history::Store, app: &mut App, now: u64) {
@@ -558,8 +732,11 @@ fn request_preview(
     });
     app.preview_generation = app.preview_generation.wrapping_add(1);
     let generation = app.preview_generation;
-    let selected = app.selected().cloned();
-    let identity = selected.as_ref().map(model::Item::preview_identity);
+    let selected = app.selected().filter(|item| app.actionable(item)).cloned();
+    let identity = selected
+        .as_ref()
+        .filter(|item| item.machine().is_none())
+        .map(model::Item::preview_identity);
     let live_start = live.select(identity.as_ref(), dimensions);
     arbiter.reset(generation, &live_start, Instant::now());
     match selected {
@@ -579,7 +756,7 @@ fn request_fallback_if_due(
     now: Instant,
 ) {
     if arbiter.fallback_due(now) {
-        if let Some(item) = app.selected().cloned() {
+        if let Some(item) = app.selected().filter(|item| app.actionable(item)).cloned() {
             runtime.preview(app.preview_generation, item);
         }
     }
@@ -587,6 +764,66 @@ fn request_fallback_if_due(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_ack_closes_popup_legacy_stays_and_failure_records_no_success() {
+        use crate::machine::testing::{item, machine};
+        for switched_client in [false, true] {
+            let mut app = App::new(Tab::Workspaces);
+            let selected =
+                item(model::Target::Workspace { id: "w1".into() }).on_machine(&machine());
+            let (sender, receiver) = std::sync::mpsc::channel();
+            sender
+                .send((
+                    selected.clone(),
+                    Ok(provider::ConfirmResult {
+                        switched_client,
+                        resolved_workspace_id: None,
+                    }),
+                ))
+                .unwrap();
+            let mut action = RemoteAction(Some(receiver));
+            let mut dirty = false;
+            assert_eq!(action.poll(&mut app, &mut dirty), (true, switched_client));
+            assert!(dirty);
+            assert_eq!(app.warning.is_none(), switched_client);
+            if !switched_client {
+                assert!(app.warning.as_ref().unwrap().contains("sidebar"));
+            }
+
+            let before = app.history().clone();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            sender
+                .send((selected, Err("outcome unknown".into())))
+                .unwrap();
+            let mut action = RemoteAction(Some(receiver));
+            dirty = false;
+            assert_eq!(action.poll(&mut app, &mut dirty), (true, false));
+            assert!(!dirty);
+            assert_eq!(app.history(), &before);
+            assert!(app.warning.as_ref().unwrap().contains("outcome unknown"));
+        }
+    }
+
+    #[test]
+    fn cached_rows_cannot_dispatch_remote_focus_or_worktree_jobs() {
+        use crate::machine::testing::{item, machine};
+        let mut app = crate::model::App::new(crate::model::Tab::Zoxide);
+        let host = machine();
+        app.cached_hosts.insert(host.namespace());
+        app.set_items(
+            crate::model::Tab::Zoxide,
+            vec![item(crate::model::Target::Directory {
+                path: "/repo".into(),
+            })
+            .on_machine(&host)],
+        );
+        let client =
+            crate::provider::Client::new(crate::provider::SystemRunner, "must-not-run".into());
+        let mut action = super::RemoteAction::default();
+        assert!(action.confirm(&mut app, &client).is_none());
+        assert!(action.0.is_none());
+        assert!(super::start_worktree(&app, &mut std::collections::HashMap::new()).is_none());
+    }
     use super::*;
     use std::ffi::{OsStr, OsString};
     use std::sync::Mutex;

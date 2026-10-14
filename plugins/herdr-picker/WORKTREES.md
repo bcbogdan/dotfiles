@@ -6,6 +6,13 @@ new branch name, a local or cached remote base branch, and the full destination
 path. No fetch is performed. Review the resolved commit and path, then press Enter
 on **Create & open**.
 
+The selected folder's **machine badge determines the execution host**. Ctrl+M or
+`machine:goblin` filters folders first; it never redirects an existing row. The
+worktree form shows the host in its title. Git discovery, branch validation,
+destination expansion (`~` uses the destination host's HOME), filesystem completion
+and creation run on that host through the versioned helper. See
+[MULTI_MACHINE.md](MULTI_MACHINE.md) for setup and protocol details.
+
 **Create Worktree** is a centered, content-sized inner form (up to 80 columns,
 normally 18–24 rows). Name, Base, and Path remain visible; the active field has a
 highlighted border and cursor. Suggestions occupy at most five rows. The outer
@@ -37,6 +44,16 @@ workspace operation, refreshing workspace identity first; it never recreates Git
 state. Successful opening records directory/workspace history and best-effort
 `zoxide add`.
 
+For remote worktrees on official Herdr, successful opening returns to the picker
+with a message to select that machine in Herdr's sidebar. With the optional fork's
+injected client token, opening navigates the viewing client and closes the picker
+after acknowledgement. Failed navigation retains the created workspace ID for
+manual retry; a timeout has unknown outcome and does not cancel navigation. See
+`MULTI_MACHINE.md` for the fork requirements and CLI contract.
+A failed open remains **Retry opening**, distinct from uncertain Git creation;
+retry refreshes workspaces only on the original host and never recreates the
+worktree. SSH creation timeouts are treated as uncertain and require rechecking.
+
 ## Keyboard compatibility
 
 The picker queries Crossterm keyboard-enhancement support and, when advertised,
@@ -59,3 +76,10 @@ input, so stale suggestions cannot replace current results. Worker polling uses
 off-thread but cannot be forcibly interrupted on a stalled network mount.
 The existing command runner returns text with lossy UTF-8 conversion, so paths
 containing non-UTF-8 bytes are not fully supported by discovery or editing.
+
+Remote directory listings are cached per form/host using opaque input-directory
+keys; `~/…` is expanded only by the remote helper. Filtering cached listings is
+immediate and late replies filter the latest input. Uncached scans are bounded
+SSH jobs behind a per-host completion gate. Bare Zoxide completion runs against
+that host's cached Zoxide paths. No remote completion reads the coordinator's
+filesystem.

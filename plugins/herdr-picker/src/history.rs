@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::{HistoryKey, Item};
 use crate::profile;
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 // Retain six months of inactive history, capped at 2,048; visible items are exempt.
 const MAX_ENTRIES: usize = 2_048;
 const STALE_AFTER_SECS: u64 = 180 * 24 * 60 * 60;
@@ -211,7 +211,7 @@ impl FileStore {
         Self {
             path: std::env::var_os("HERDR_PLUGIN_STATE_DIR")
                 .map(PathBuf::from)
-                .map(|directory| directory.join("picker-history.json")),
+                .map(|directory| directory.join("picker-history-v2.json")),
         }
     }
 
@@ -294,21 +294,39 @@ impl Store for FileStore {
 }
 
 fn load_disk(path: &Path, parent: &Path, now: u64) -> Result<LoadOutcome, String> {
+    let mut imported = false;
     let raw = match fs::read(path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LoadOutcome {
-                history: History::default(),
-                warning: None,
-                logical_time: 0,
-            });
+            let legacy = if path
+                .file_name()
+                .is_some_and(|name| name == "picker-history-v2.json")
+            {
+                match fs::read(parent.join("picker-history.json")) {
+                    Ok(raw) => Some(raw),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.to_string()),
+                }
+            } else {
+                None
+            };
+            if let Some(raw) = legacy {
+                imported = true;
+                raw
+            } else {
+                return Ok(LoadOutcome {
+                    history: History::default(),
+                    warning: None,
+                    logical_time: 0,
+                });
+            }
         }
         Err(error) => return Err(error.to_string()),
     };
     let parsed = serde_json::from_slice::<Document>(&raw)
         .map_err(|error| error.to_string())
         .and_then(|document| {
-            if document.version == VERSION {
+            if document.version == VERSION || document.version == 1 {
                 Ok(document)
             } else {
                 Err(format!("unsupported history version {}", document.version))
@@ -339,6 +357,9 @@ fn load_disk(path: &Path, parent: &Path, now: u64) -> Result<LoadOutcome, String
             })
         }
         Err(error) => {
+            if imported {
+                return Err(format!("legacy history import failed: {error}"));
+            }
             let quarantine = unique_path(parent, ".picker-history.corrupt-");
             fs::rename(path, &quarantine).map_err(|rename| {
                 format!("history is corrupt ({error}); quarantine failed: {rename}")
@@ -498,6 +519,33 @@ pub fn unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v1_import_preserves_local_history_and_rollback_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = directory.path().join("picker-history.json");
+        let original = br#"{"version":1,"entries":[{"key":{"kind":"workspace","value":"w1"},"first_seen":10,"last_seen":20,"last_accessed":20}]}"#;
+        fs::write(&legacy, original).unwrap();
+        let store = FileStore::at(directory.path().join("picker-history-v2.json"));
+        let loaded = store.load().unwrap();
+        let key = HistoryKey::workspace("w1");
+        assert_eq!(loaded.history.last_accessed(&key), Some(20));
+        let remote = HistoryKey::Remote {
+            namespace: crate::machine::testing::machine().namespace(),
+            key: Box::new(key.clone()),
+        };
+        let mut history = loaded.history;
+        history.access(&remote, 30);
+        store
+            .save(&history, &HashSet::from([key.clone(), remote.clone()]), 30)
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().history.last_accessed(&remote),
+            Some(30)
+        );
+        assert_eq!(store.load().unwrap().history.last_accessed(&key), Some(20));
+        assert_eq!(fs::read(legacy).unwrap(), original);
+    }
     use crate::model::{Tab, Target};
     use std::sync::{Arc, Barrier, Mutex};
 

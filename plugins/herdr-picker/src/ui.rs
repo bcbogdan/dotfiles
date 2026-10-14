@@ -11,14 +11,33 @@ use crate::profile;
 const STACKED_AT: u16 = 96;
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let [body, footer] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
+    let errors = app.host_errors();
+    let [machine, body, errors_area, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(status_height(app)),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" Machine: "),
+            Span::styled(app.filter_label(), Style::new().cyan().bold()),
+            Span::styled("  Ctrl+M switch", Style::new().dim()),
+        ])),
+        machine,
+    );
+    frame.render_widget(Paragraph::new(errors.join("\n")).red(), errors_area);
     let (left, right) = panels(body, app.preview_mode.enabled());
     draw_left(frame, app, left);
     if let Some(right) = right {
         draw_preview(frame, app, right);
     }
     frame.render_widget(Paragraph::new(footer_text(app, footer.width)).dim(), footer);
+}
+
+pub fn status_height(app: &App) -> u16 {
+    u16::try_from(app.host_errors().len()).unwrap_or(10).min(10)
 }
 
 fn panels(area: Rect, preview_enabled: bool) -> (Rect, Option<Rect>) {
@@ -38,7 +57,12 @@ fn panels(area: Rect, preview_enabled: bool) -> (Rect, Option<Rect>) {
 }
 
 pub fn preview_dimensions(area: Rect, preview_enabled: bool) -> (u16, u16) {
-    let [body, _] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+    let [_, body, _] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
     let (_, preview) = panels(body, preview_enabled);
     let Some(preview) = preview else {
         return (1, 1);
@@ -49,6 +73,7 @@ pub fn preview_dimensions(area: Rect, preview_enabled: bool) -> (u16, u16) {
 
 fn draw_left(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered()
+        .title(" Picker ")
         .border_type(BorderType::Rounded)
         .border_style(Style::new().dim());
     let inner = block.inner(area);
